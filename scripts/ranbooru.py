@@ -13,8 +13,14 @@ import json
 
 from modules.processing import process_images, StableDiffusionProcessingImg2Img
 from modules import shared
-from modules.sd_hijack import model_hijack
-from modules import deepbooru
+try:
+    from modules.sd_hijack import model_hijack
+except ImportError:
+    model_hijack = None
+try:
+    from modules import deepbooru
+except ImportError:
+    deepbooru = None
 from modules.ui_components import InputAccordion
 
 extension_root = scripts.basedir()
@@ -178,39 +184,80 @@ class Gelbooru(Booru):
 
     def get_data(self, add_tags, max_pages=10, id=''):
         global COUNT
-        loop_msg = True # avoid showing same msg twice
-        for loop in range(2): # run loop at most twice
-            if id:
-                add_tags = ''
-            
-            # Build the API URL with credentials if available
-            api_params = f"&pid={random.randint(0, max_pages-1)}{id}{add_tags}"
-            if self.api_key and self.user_id:
-                api_params += f"&api_key={self.api_key}&user_id={self.user_id}"
-            
-            self.booru_url = f"{self.booru_url}{api_params}"
-            # The randint function is an alias to randrange(a, b+1), so 'max_pages' should be passed as 'max_pages-1'
+        if id:
+            add_tags = ''
+
+        base_url = self.booru_url
+        cred_params = f"&api_key={self.api_key}&user_id={self.user_id}" if self.api_key and self.user_id else ''
+
+        def fetch(pid):
+            # Build the URL fresh each attempt - never mutate the base
+            url = f"{base_url}&pid={pid}{id}{add_tags}{cred_params}"
+            self.booru_url = url  # kept for the downstream debug print
             if self.fringeBenefits:
-                res = requests.get(self.booru_url, cookies={'fringeBenefits': 'yup'})
+                res = requests.get(url, cookies={'fringeBenefits': 'yup'})
             else:
-                res = requests.get(self.booru_url)
-            data = res.json()
-            COUNT = data['@attributes']['count']
-            if COUNT <= max_pages*POST_AMOUNT:
-                max_pages = COUNT // POST_AMOUNT+1
-                # If max_pages is bigger than available pages, loop the function with updated max_pages based on the value of COUNT
-                while loop_msg:
-                    print(f" Processing {COUNT} results.")
-                    loop_msg = False
-                    # avoid showing same msg twice
-                continue
-            else:
-                print(f" Processing {max_pages*POST_AMOUNT} out of {COUNT} results.")
-            break
+                res = requests.get(url)
+            return res.json()
+
+        # The randint function is an alias to randrange(a, b+1), so 'max_pages' is passed as 'max_pages-1'
+        pid = random.randint(0, max(0, max_pages - 1))
+        data = fetch(pid)
+        COUNT = data.get('@attributes', {}).get('count', 0)
+
+        # If fewer results exist than the requested page range, re-roll within the actual range
+        if COUNT <= max_pages * POST_AMOUNT:
+            actual_pages = max(1, COUNT // POST_AMOUNT + 1)
+            print(f" Processing {COUNT} results.")
+            if actual_pages != max_pages:
+                pid = random.randint(0, actual_pages - 1)
+                data = fetch(pid)
+        else:
+            print(f" Processing {max_pages * POST_AMOUNT} out of {COUNT} results.")
+
+        # If the chosen page came back empty, walk down one page at a time
+        retries = 0
+        while not data.get('post') and pid > 0 and retries < 15:
+            pid -= 1
+            retries += 1
+            print(f"Ranbooru: page {pid + 1} returned no posts, retrying page {pid}")
+            data = fetch(pid)
         return data
 
     def get_post(self, add_tags, max_pages=10, id=''):
         return self.get_data(add_tags, max_pages, "&id=" + id)
+
+    def filter_character_tags(self, tag_string):
+        """ Given a space-separated tag string from a Gelbooru post, query the
+        Tag List API in a single batched request and strip out any tags whose
+        type is 4 (character). Returns the filtered tag string.
+        Falls back to the original string on any error.
+        """
+        if not tag_string or not tag_string.strip():
+            return tag_string
+        try:
+            tags = tag_string.split(' ')
+            names_param = '%20'.join(tags)
+            url = f"https://gelbooru.com/index.php?page=dapi&s=tag&q=index&json=1&names={names_param}&limit=100"
+            if self.api_key and self.user_id:
+                url += f"&api_key={self.api_key}&user_id={self.user_id}"
+            res = requests.get(url)
+            if res.status_code != 200 or not res.text.strip():
+                print(f"Ranbooru: character tag filter request failed (status {res.status_code}), skipping filter")
+                return tag_string
+            data = res.json()
+            tag_entries = data.get('tag', [])
+            character_names = {entry['name'] for entry in tag_entries if entry.get('type') == 4}
+            if not character_names:
+                return tag_string
+            filtered = [t for t in tags if t not in character_names]
+            removed = len(tags) - len(filtered)
+            if removed > 0:
+                print(f"Ranbooru: filtered {removed} character tag(s)")
+            return ' '.join(filtered)
+        except Exception:
+            print("Ranbooru: error while filtering character tags, using unfiltered tags")
+            return tag_string
 
 
 class XBooru(Booru):
@@ -726,12 +773,32 @@ class Script(scripts.Script):
         with InputAccordion(False, label="Ranbooru", elem_id=self.elem_id("ra_enable")) as enabled:
             booru = gr.Dropdown(
                 ["safebooru", "rule34", "danbooru", "gelbooru", "konachan", 'yande.re', 'aibooru', 'xbooru', 'e621'], label="Booru", value="safebooru")
-            max_pages = gr.Slider(label="Max Pages", minimum=1, maximum=100, value=100, step=1)
+            max_pages = gr.Slider(label="Max Pages", minimum=1, maximum=1000, value=100, step=1)
             gr.Markdown("""## Post""")
             post_id = gr.Textbox(lines=1, label="Post ID")
             gr.Markdown("""## Tags""")
             tags = gr.Textbox(lines=1, label="Tags to Search (Pre)")
             remove_tags = gr.Textbox(lines=1, label="Tags to Remove (Post)")
+            filter_character_tags = gr.Checkbox(label="Filter Character Tags (Gelbooru only)", value=False, info="Removes character name tags via an extra API lookup. Adds one request per generation.")
+            skip_existing_tags = gr.Checkbox(label="Skip tags already in prompt", value=False, info="Don't add fetched tags that already appear in your prompt")
+            with gr.Accordion("Tag Presets", open=False):
+                use_random_preset = gr.Checkbox(label="Pick a random preset per generation (overrides Tags field above)", value=False)
+                with gr.Row():
+                    tag_preset_1 = gr.Textbox(lines=1, label="Preset 1")
+                    preset_max_pages_1 = gr.Number(value=0, label="Max Pages", precision=0, minimum=0)
+                with gr.Row():
+                    tag_preset_2 = gr.Textbox(lines=1, label="Preset 2")
+                    preset_max_pages_2 = gr.Number(value=0, label="Max Pages", precision=0, minimum=0)
+                with gr.Row():
+                    tag_preset_3 = gr.Textbox(lines=1, label="Preset 3")
+                    preset_max_pages_3 = gr.Number(value=0, label="Max Pages", precision=0, minimum=0)
+                with gr.Row():
+                    tag_preset_4 = gr.Textbox(lines=1, label="Preset 4")
+                    preset_max_pages_4 = gr.Number(value=0, label="Max Pages", precision=0, minimum=0)
+                with gr.Row():
+                    tag_preset_5 = gr.Textbox(lines=1, label="Preset 5")
+                    preset_max_pages_5 = gr.Number(value=0, label="Max Pages", precision=0, minimum=0)
+                gr.Markdown("_Max Pages 0 = use global Max Pages setting_")
             mature_rating = gr.Radio(list(RATINGS['safebooru']), label="Mature Rating", value="All")
             remove_bad_tags = gr.Checkbox(label="Remove bad tags", value=True)
             shuffle_tags = gr.Checkbox(label="Shuffle tags", value=True)
@@ -789,6 +856,9 @@ class Script(scripts.Script):
                     with gr.Box():
                         mix_prompt = gr.Checkbox(label="Mix prompts", value=False)
                         mix_amount = gr.Slider(value=2, label="Mix amount", minimum=2, maximum=10, step=1)
+                        mix_ratio = gr.Slider(value=0.5, label="Mix ratio", minimum=0.0, maximum=1.0, step=0.05, info="0 = all tags from image 1, 1 = all tags from image 2, 0.5 = even split")
+                        mix_from_presets = gr.Checkbox(label="Mix from presets", value=False, interactive=False, info="Image 2 is drawn from a random Tag Preset's search. Requires random presets enabled.")
+                        use_random_preset.change(fn=lambda x: gr.update(interactive=x, value=False) if not x else gr.update(interactive=True), inputs=[use_random_preset], outputs=[mix_from_presets])
                     with gr.Box():
                         chaos_mode = gr.Radio(["None", "Chaos", "Less Chaos"], label="Chaos Mode", value="None")
                         chaos_amount = gr.Slider(value=0.5, label="Chaos Amount %", minimum=0.1, maximum=1, step=0.05)
@@ -803,9 +873,21 @@ class Script(scripts.Script):
                 lora_folder = gr.Textbox(lines=1, label="LoRAs Subfolder")
                 lora_amount = gr.Slider(value=1, label="LoRAs Amount", minimum=1, maximum=10, step=1)
             with gr.Box():
-                lora_min = gr.Slider(value=-1.0, label="Min LoRAs Weight", minimum=-1.0, maximum=1, step=0.1)
-                lora_max = gr.Slider(value=1.0, label="Max LoRAs Weight", minimum=-1.0, maximum=1.0, step=0.1)
+                lora_min = gr.Slider(value=-1.0, label="Min LoRAs Weight", minimum=-2.0, maximum=2.0, step=0.1)
+                lora_max = gr.Slider(value=1.0, label="Max LoRAs Weight", minimum=-2.0, maximum=2.0, step=0.1)
                 lora_custom_weights = gr.Textbox(lines=1, label="LoRAs Custom Weights")
+            lora_folder_2_enabled = gr.Checkbox(label="Enable second LoRA folder", value=False)
+            with gr.Box(visible=False) as lora_folder_2_group:
+                lora_folder_2 = gr.Textbox(lines=1, label="LoRAs Subfolder 2")
+                lora_amount_2 = gr.Slider(value=1, label="LoRAs Amount 2", minimum=1, maximum=10, step=1)
+                lora_min_2 = gr.Slider(value=-1.0, label="Min LoRAs Weight 2", minimum=-2.0, maximum=2.0, step=0.1)
+                lora_max_2 = gr.Slider(value=1.0, label="Max LoRAs Weight 2", minimum=-2.0, maximum=2.0, step=0.1)
+                lora_custom_weights_2 = gr.Textbox(lines=1, label="LoRAs Custom Weights 2")
+            lora_folder_2_enabled.change(
+                fn=lambda x: gr.update(visible=x),
+                inputs=[lora_folder_2_enabled],
+                outputs=[lora_folder_2_group]
+            )
 
         search_refresh_btn.click(
             fn=self.refresh_ser,
@@ -833,7 +915,7 @@ class Script(scripts.Script):
             outputs=[api_key, user_id, credentials_status, clear_credentials_btn]
         )
 
-        return [enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn]
+        return [enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, filter_character_tags, skip_existing_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, mix_ratio, mix_from_presets, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, lora_folder_2_enabled, lora_folder_2, lora_amount_2, lora_min_2, lora_max_2, lora_custom_weights_2, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_random_preset, tag_preset_1, tag_preset_2, tag_preset_3, tag_preset_4, tag_preset_5, preset_max_pages_1, preset_max_pages_2, preset_max_pages_3, preset_max_pages_4, preset_max_pages_5]
 
     def check_orientation(self, img):
         """Check if image is portrait, landscape or square"""
@@ -845,24 +927,42 @@ class Script(scripts.Script):
         else:
             return [768, 768]
 
-    def loranado(self, lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev):
+    def _build_lora_segment(self, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights):
+        """ Build a lora prompt segment for a single folder config.
+        Returns '' if the folder is empty/invalid so it contributes nothing. """
+        segment = ''
+        if not lora_folder or not lora_folder.strip():
+            return segment
+        try:
+            loras = os.listdir(f'{lora_folder}')
+        except Exception:
+            print(f'Ranbooru: LoRA folder "{lora_folder}" could not be read, skipping')
+            return segment
+        loras = [lora.replace('.safetensors', '') for lora in loras if lora.endswith('.safetensors')]
+        if not loras:
+            print(f'Ranbooru: no .safetensors found in "{lora_folder}", skipping')
+            return segment
+        custom = [w.strip() for w in lora_custom_weights.split(',')] if lora_custom_weights.strip() else []
+        for l in range(0, lora_amount):
+            lora_weight = 0
+            if l < len(custom) and custom[l] != '':
+                lora_weight = float(custom[l])
+            while lora_weight == 0:
+                lora_weight = round(random.uniform(lora_min, lora_max), 1)
+            segment += f'<lora:{random.choice(loras)}:{lora_weight}>'
+        return segment
+
+    def loranado(self, lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev,
+                 lora_folder_2_enabled=False, lora_folder_2='', lora_amount_2=1, lora_min_2=-1.0, lora_max_2=1.0, lora_custom_weights_2=''):
         lora_prompt = ''
         if lora_enabled:
             if lora_lock_prev:
                 lora_prompt = self.previous_loras
             else:
-                loras = []
-                loras = os.listdir(f'{lora_folder}')
-                # get only .safetensors files
-                loras = [lora.replace('.safetensors', '') for lora in loras if lora.endswith('.safetensors')]
-                for l in range(0, lora_amount):
-                    lora_weight = 0
-                    if lora_custom_weights != '':
-                        lora_weight = float(lora_custom_weights.split(',')[l])
-                    while lora_weight == 0:
-                        lora_weight = round(random.uniform(lora_min, lora_max), 1)
-                    lora_prompt += f'<lora:{random.choice(loras)}:{lora_weight}>'
-                    self.previous_loras = lora_prompt
+                lora_prompt += self._build_lora_segment(lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights)
+                if lora_folder_2_enabled:
+                    lora_prompt += self._build_lora_segment(lora_folder_2, lora_amount_2, lora_min_2, lora_max_2, lora_custom_weights_2)
+                self.previous_loras = lora_prompt
         if lora_prompt:
             if isinstance(p.prompt, list):
                 for num, pr in enumerate(p.prompt):
@@ -871,13 +971,30 @@ class Script(scripts.Script):
                 p.prompt = f'{lora_prompt} {p.prompt}'
         return p
 
-    def before_process(self, p, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn):        # Manage Cache
+    def before_process(self, p, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, filter_character_tags, skip_existing_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, mix_ratio, mix_from_presets, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, lora_folder_2_enabled, lora_folder_2, lora_amount_2, lora_min_2, lora_max_2, lora_custom_weights_2, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_random_preset=False, tag_preset_1='', tag_preset_2='', tag_preset_3='', tag_preset_4='', tag_preset_5='', preset_max_pages_1=0, preset_max_pages_2=0, preset_max_pages_3=0, preset_max_pages_4=0, preset_max_pages_5=0):        # Manage Cache
         if use_cache and not requests_cache.patcher.is_installed():
             requests_cache.install_cache('ranbooru_cache', backend='sqlite', expire_after=3600)
         elif not use_cache and requests_cache.patcher.is_installed():
             requests_cache.uninstall_cache()
         
         if enabled:
+            # Tag Preset: pick a random non-empty preset to override the tags field
+            if use_random_preset:
+                presets = [pr for pr in [tag_preset_1, tag_preset_2, tag_preset_3, tag_preset_4, tag_preset_5] if pr.strip()]
+                if presets:
+                    chosen_index = [tag_preset_1, tag_preset_2, tag_preset_3, tag_preset_4, tag_preset_5].index(
+                        random.choice(presets)
+                    )
+                    tags = [tag_preset_1, tag_preset_2, tag_preset_3, tag_preset_4, tag_preset_5][chosen_index]
+                    preset_pages = [preset_max_pages_1, preset_max_pages_2, preset_max_pages_3, preset_max_pages_4, preset_max_pages_5][chosen_index]
+                    if preset_pages and int(preset_pages) > 0:
+                        max_pages = int(preset_pages)
+                        print(f'Ranbooru: using random tag preset: "{tags}" with max_pages={max_pages}')
+                    else:
+                        print(f'Ranbooru: using random tag preset: "{tags}" (global max_pages={max_pages})')
+                else:
+                    print('Ranbooru: random preset enabled but no presets defined, falling back to Tags field')
+
             # Handle Gelbooru credentials
             gelbooru_api_key = None
             gelbooru_user_id = None
@@ -975,6 +1092,34 @@ class Script(scripts.Script):
             api_url = booru_apis.get(booru, Gelbooru(fringe_benefits))
             print(f'Using {booru}')
 
+            # Secondary pool for preset-mix: image 2 onward drawn from a random
+            # Tag Preset's search. Fetched BEFORE the primary pool on purpose:
+            # get_data sets the global COUNT used by random_number for indexing,
+            # and the primary pool's fetch must be the one that sets it last.
+            preset_mix_data = None
+            if mix_prompt and mix_from_presets and use_random_preset:
+                preset_pool = [(tp, pp) for tp, pp in zip(
+                    [tag_preset_1, tag_preset_2, tag_preset_3, tag_preset_4, tag_preset_5],
+                    [preset_max_pages_1, preset_max_pages_2, preset_max_pages_3, preset_max_pages_4, preset_max_pages_5]
+                ) if tp.strip()]
+                if preset_pool:
+                    mix_preset_tags, mix_preset_pages = random.choice(preset_pool)
+                    mix_max_pages = int(mix_preset_pages) if mix_preset_pages and int(mix_preset_pages) > 0 else max_pages
+                    mix_add_tags = '&tags=-animated' + f'+{mix_preset_tags.replace(",", "+")}'
+                    if mature_rating != 'All':
+                        mix_add_tags += f'+rating:{RATINGS[booru][mature_rating]}'
+                    print(f'Ranbooru: preset-mix second pool: "{mix_preset_tags}" (max_pages={mix_max_pages})')
+                    try:
+                        preset_mix_data = api_url.get_data(mix_add_tags, mix_max_pages)
+                        if not preset_mix_data.get('post'):
+                            preset_mix_data = None
+                            print('Ranbooru: preset-mix pool came back empty, mixing from primary pool instead')
+                    except Exception:
+                        preset_mix_data = None
+                        print('Ranbooru: preset-mix fetch failed, mixing from primary pool instead')
+                else:
+                    print('Ranbooru: Mix from presets enabled but no presets defined')
+
             # Manage Post ID
             if post_id:
                 data = api_url.get_post(add_tags, max_pages, post_id)
@@ -985,6 +1130,7 @@ class Script(scripts.Script):
             # Replace null scores with 0s
             for post in data['post']:
                 post['score'] = post.get('score', 0)
+
             # Sort based on sorting_order
             if sorting_order == 'High Score':
                 data['post'] = sorted(data['post'], key=lambda k: k.get('score', 0), reverse=True)
@@ -1000,25 +1146,58 @@ class Script(scripts.Script):
                     random_post = data['post'][random_numbers[0]]
                 else:
                     if mix_prompt:
-                        temp_tags = []
-                        max_tags = 0
-                        for _ in range(0, mix_amount):
-                            if not post_id:
-                                random_mix_number = self.random_number(sorting_order, 1)[0]
-                            temp_tags.extend(data['post'][random_mix_number]['tags'].split(' '))
-                            max_tags = max(max_tags, len(data['post'][random_mix_number]['tags'].split(' ')))
-                        # distinct temp_tags
-                        temp_tags = list(set(temp_tags))
-                        random_post = data['post'][random_number]
-                        max_tags = min(max(len(temp_tags), 20), max_tags)
-                        random_post['tags'] = ' '.join(random.sample(temp_tags, max_tags))
+                        # Gather tag lists: source 1 from the primary pool,
+                        # sources 2+ from the preset-mix pool when available
+                        source_tag_lists = []
+                        for mix_i in range(0, mix_amount):
+                            if mix_i > 0 and preset_mix_data is not None:
+                                pool = preset_mix_data['post']
+                                random_mix_number = random.randint(0, len(pool) - 1)
+                            else:
+                                pool = data['post']
+                                if post_id:
+                                    random_mix_number = random_number
+                                else:
+                                    random_mix_number = self.random_number(sorting_order, 1)[0]
+                            tag_list = [t for t in pool[random_mix_number]['tags'].split(' ') if t.strip()]
+                            if tag_list:
+                                source_tag_lists.append(tag_list)
+                        # Distribute the tag budget across sources by mix_ratio:
+                        # 0 = all from the first post, 1 = all from the last,
+                        # 0.5 = even split. For 3+ posts, weights interpolate
+                        # linearly from (1-ratio) to ratio across the sources.
+                        mixed_tags = []
+                        if source_tag_lists:
+                            total_budget = max(len(tl) for tl in source_tag_lists)
+                            n_sources = len(source_tag_lists)
+                            if n_sources == 1:
+                                weights = [1.0]
+                            else:
+                                raw = [(1.0 - mix_ratio) * (1 - i / (n_sources - 1)) + mix_ratio * (i / (n_sources - 1)) for i in range(n_sources)]
+                                total_w = sum(raw)
+                                weights = [w / total_w if total_w > 0 else 1.0 / n_sources for w in raw]
+                            for tl, w in zip(source_tag_lists, weights):
+                                take = min(len(tl), int(round(total_budget * w)))
+                                if take > 0:
+                                    mixed_tags.extend(random.sample(tl, take))
+                        # De-duplicate while preserving order
+                        seen_tags = set()
+                        mixed_tags = [t for t in mixed_tags if not (t in seen_tags or seen_tags.add(t))]
+                        # Copy the post so the cached data is never mutated
+                        random_post = dict(data['post'][random_number])
+                        if mixed_tags:
+                            random_post['tags'] = ' '.join(mixed_tags)
                     else:
                         try:
                             random_post = data['post'][random_number]
                         except IndexError:
                             raise Exception(
                                 "No posts found with those tags. Try lowering the pages or changing the tags.")
-                clean_tags = random_post['tags'].replace('(', r'\(').replace(')', r'\)')
+                # Filter character tags (Gelbooru only) - only on the selected post
+                post_tags = random_post['tags']
+                if filter_character_tags and isinstance(api_url, Gelbooru):
+                    post_tags = api_url.filter_character_tags(post_tags)
+                clean_tags = post_tags.replace('(', r'\(').replace(')', r'\)')
                 temp_tags = random.sample(clean_tags.split(' '), len(clean_tags.split(' '))) if shuffle_tags else clean_tags.split(' ')
                 prompts.append(','.join(temp_tags))
                 preview_urls.append(random_post.get('file_url', 'https://pic.re/image'))
@@ -1044,6 +1223,32 @@ class Script(scripts.Script):
                     new_prompt = new_prompt.replace("_", " ")
                 new_prompts.append(new_prompt)
             prompts = new_prompts
+
+            # Drop fetched tags that already appear in the user's prompt.
+            # Normalised comparison: case-insensitive, underscores and spaces
+            # treated as equivalent, and any weight syntax like (tag:1.2) or
+            # escaped parens stripped so 'blue_hair' matches '(blue hair:1.2)'.
+            if skip_existing_tags and self.original_prompt:
+                def _norm(tag):
+                    t = tag.strip().lower()
+                    t = t.replace('\\(', '').replace('\\)', '')
+                    if t.startswith('(') and ':' in t:
+                        t = t[1:].rsplit(':', 1)[0]
+                    t = t.strip('()')
+                    return t.replace('_', ' ').strip()
+
+                existing = {_norm(t) for t in self.original_prompt.split(',') if _norm(t)}
+                if existing:
+                    deduped_prompts = []
+                    total_removed = 0
+                    for prompt in prompts:
+                        kept = [t for t in prompt.split(',') if _norm(t) not in existing]
+                        total_removed += len(prompt.split(',')) - len(kept)
+                        deduped_prompts.append(','.join(kept))
+                    prompts = deduped_prompts
+                    if total_removed:
+                        print(f'Ranbooru: skipped {total_removed} tag(s) already in the prompt')
+
             if len(prompts) == 1:
                 print('Processing Single Prompt')
                 p.prompt = f"{p.prompt},{prompts[-1]}" if p.prompt else prompts[-1]
@@ -1097,17 +1302,19 @@ class Script(scripts.Script):
                     p.prompt = self.original_prompt
             if negative_mode == 'Negative' or chaos_mode in ['Chaos', 'Less Chaos']:
                 # NEGATIVE PROMPT FIX
-                neg_prompt_tokens = []
-                for pr in p.negative_prompt:
-                    neg_prompt_tokens.append(model_hijack.get_prompt_lengths(pr)[1])
-                if len(set(neg_prompt_tokens)) != 1:
-                    print('Padding negative prompts')
-                    max_tokens = max(neg_prompt_tokens)
-                    for num, neg in enumerate(neg_prompt_tokens):
-                        while neg < max_tokens:
-                            p.negative_prompt[num] += random.choice(p.negative_prompt[num].split(','))
-                            # p.negative_prompt[num] += '_'
-                            neg = model_hijack.get_prompt_lengths(p.negative_prompt[num])[1]
+                if model_hijack is not None:
+                    neg_prompt_tokens = []
+                    for pr in p.negative_prompt:
+                        neg_prompt_tokens.append(model_hijack.get_prompt_lengths(pr)[1])
+                    if len(set(neg_prompt_tokens)) != 1:
+                        print('Padding negative prompts')
+                        max_tokens = max(neg_prompt_tokens)
+                        for num, neg in enumerate(neg_prompt_tokens):
+                            while neg < max_tokens:
+                                p.negative_prompt[num] += random.choice(p.negative_prompt[num].split(','))
+                                neg = model_hijack.get_prompt_lengths(p.negative_prompt[num])[1]
+                else:
+                    print('Ranbooru: model_hijack unavailable in Forge Neo, skipping negative prompt padding.')
 
             if limit_tags < 1:
                 if isinstance(p.prompt, list):
@@ -1126,7 +1333,7 @@ class Script(scripts.Script):
                 p.seed = [p.seed] * p.batch_size
 
             # LORANADO
-            p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev)
+            p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev, lora_folder_2_enabled, lora_folder_2, lora_amount_2, lora_min_2, lora_max_2, lora_custom_weights_2)
             if use_deepbooru and not use_img2img:
                 self.last_img = last_img
                 tagged_prompts = self.use_autotagger('deepbooru')
@@ -1155,9 +1362,9 @@ class Script(scripts.Script):
                     controlNetModule.update_cn_script_in_processing(p, copied_networks)
 
         elif lora_enabled:
-            p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev)
+            p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev, lora_folder_2_enabled, lora_folder_2, lora_amount_2, lora_min_2, lora_max_2, lora_custom_weights_2)
 
-    def postprocess(self, p, processed, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn):
+    def postprocess(self, p, processed, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, filter_character_tags, skip_existing_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, mix_ratio, mix_from_presets, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, lora_folder_2_enabled, lora_folder_2, lora_amount_2, lora_min_2, lora_max_2, lora_custom_weights_2, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_random_preset=False, tag_preset_1='', tag_preset_2='', tag_preset_3='', tag_preset_4='', tag_preset_5='', preset_max_pages_1=0, preset_max_pages_2=0, preset_max_pages_3=0, preset_max_pages_4=0, preset_max_pages_5=0):
         if use_img2img and not use_ip and enabled:
             print('Using pictures')
             if crop_center:
@@ -1233,6 +1440,9 @@ class Script(scripts.Script):
             list: the tagged prompts
         """
         if model == 'deepbooru':
+            if deepbooru is None:
+                print('Ranbooru: Deepbooru is not available in Forge Neo. Skipping autotagging.')
+                return [self.original_prompt] if isinstance(self.original_prompt, str) else self.original_prompt
             if isinstance(self.original_prompt, str):
                 orig_prompt = [self.original_prompt]
             else:
