@@ -105,6 +105,7 @@ POST_AMOUNT = 100
 COUNT = 100 #Number of images the search returned. Booru classes below were modified to update this value with the latest search result count.
 DEBUG = False
 REQUEST_TIMEOUT = 20  # seconds; prevents a stalled booru from hanging generation
+DEFAULT_BOORU = 'safebooru'  # single source of truth for the default booru
 
 # Booru requests go through a dedicated CachedSession rather than
 # requests_cache.install_cache(), which would monkeypatch `requests` globally
@@ -171,15 +172,13 @@ RATINGS = {
 
 
 def get_available_ratings(booru):
-    mature_ratings = gr.Radio.update(choices=RATINGS[booru].keys(), value="All")
-    return mature_ratings
+    # gr.update (not gr.Radio.update) - the class-method form was removed in
+    # Gradio 4.x, which Forge Neo uses. list() the keys so choices is concrete.
+    return gr.update(choices=list(RATINGS[booru].keys()), value="All")
 
 
 def show_fringe_benefits(booru):
-    if booru == 'gelbooru':
-        return gr.Checkbox.update(visible=True)
-    else:
-        return gr.Checkbox.update(visible=False)
+    return gr.update(visible=(booru == 'gelbooru'))
 
 
 def check_exception(booru, parameters):
@@ -849,7 +848,7 @@ class Script(scripts.Script):
         
         with InputAccordion(False, label="Ranbooru", elem_id=self.elem_id("ra_enable")) as enabled:
             booru = gr.Dropdown(
-                ["safebooru", "rule34", "danbooru", "gelbooru", "konachan", 'yande.re', 'aibooru', 'xbooru', 'e621'], label="Booru", value="safebooru")
+                ["safebooru", "rule34", "danbooru", "gelbooru", "konachan", 'yande.re', 'aibooru', 'xbooru', 'e621'], label="Booru", value=DEFAULT_BOORU)
             max_pages = gr.Slider(label="Max Pages", minimum=1, maximum=1000, value=100, step=1)
             gr.Markdown("""## Post""")
             post_id = gr.Textbox(lines=1, label="Post ID")
@@ -881,8 +880,15 @@ class Script(scripts.Script):
             shuffle_tags = gr.Checkbox(label="Shuffle tags", value=True)
             change_dash = gr.Checkbox(label='Convert "_" to spaces', value=False)
             same_prompt = gr.Checkbox(label="Use same prompt for all images", value=False)
-            fringe_benefits = gr.Checkbox(label="Fringe Benefits", value=True)            # API credentials for Gelbooru
-            with gr.Group(visible=True) as gelbooru_credentials_group:
+            # Fringe Benefits and the credentials group are Gelbooru-only. Their
+            # initial visibility matches the default booru (safebooru) so they
+            # start hidden; the booru.change handlers below reveal them when
+            # Gelbooru is selected. (Previously both rendered visible at load
+            # regardless of the default, since .change only fires on change.)
+            _default_is_gelbooru = (DEFAULT_BOORU == 'gelbooru')
+            fringe_benefits = gr.Checkbox(label="Fringe Benefits", value=True, visible=_default_is_gelbooru)
+            # API credentials for Gelbooru
+            with gr.Group(visible=_default_is_gelbooru) as gelbooru_credentials_group:
                 gr.Markdown("### Gelbooru API Credentials")
                 api_key = gr.Textbox(
                     lines=1, label="API Key", placeholder="Enter your Gelbooru API key",
@@ -1463,7 +1469,9 @@ class Script(scripts.Script):
 
             if use_same_seed:
                 p.seed = random.randint(0, 2 ** 32 - 1) if p.seed == -1 else p.seed
-                p.seed = [p.seed] * p.batch_size
+                # One seed per generated image across the whole run, not just one
+                # batch: a run produces batch_size * n_iter images.
+                p.seed = [p.seed] * (p.batch_size * p.n_iter)
 
             # LORANADO
             p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev, lora_folder_2_enabled, lora_folder_2, lora_amount_2, lora_min_2, lora_max_2, lora_custom_weights_2)

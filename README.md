@@ -50,6 +50,9 @@ This fork diverges from [Inzaniak/sd-webui-ranbooru](https://github.com/Inzaniak
 - **Mix mode now pairs the img2img seed image with the mix.** The first mix source is the base post whose image is used for img2img, so the seed image corresponds to tags that actually went into the prompt (previously it came from an unrelated post).
 - **Caching no longer affects other extensions.** The extension used `requests_cache.install_cache()`, which monkeypatches `requests` globally for the entire WebUI process; it now uses a dedicated `CachedSession` for booru requests only. Credentials remain excluded from the cache.
 - Preset selection no longer collapses duplicate preset text to the first entry's Max Pages override.
+- **Use Same Seed** now produces one seed per image across the whole run (`batch_size × n_iter`), not just one batch's worth.
+- **Gradio 4.x compatibility:** the two remaining `gr.Radio.update` / `gr.Checkbox.update` calls (removed in Gradio 4.x, which Forge Neo uses) are converted to `gr.update`.
+- The Gelbooru credentials panel and the Fringe Benefits checkbox now start hidden when the default booru isn't Gelbooru, instead of flashing visible until the booru dropdown is changed.
 - Assorted upstream cleanups (e621 class/name and `get_post` return, duplicated `COUNT` line in Yandere).
 
 > **Note on the companion State extension:** if you use `sd-webui-state` to persist panel settings, clear the `state-ext-ranbooru-*` keys from `localStorage` (or re-set the controls once) after updating. These additions inserted new controls into the middle of the panel's control list, which shifts the positional indices State uses; appending them at the end would have avoided the break, and a future version may re-order them to restore compatibility.
