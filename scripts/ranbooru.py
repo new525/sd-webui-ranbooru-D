@@ -104,6 +104,7 @@ BW_BG = ['monochrome', 'greyscale', 'grayscale']
 POST_AMOUNT = 100
 COUNT = 100 #Number of images the search returned. Booru classes below were modified to update this value with the latest search result count.
 DEBUG = False
+REQUEST_TIMEOUT = 20  # seconds; prevents a stalled booru from hanging generation
 RATING_TYPES = {
     "none": {
         "All": "All"
@@ -164,8 +165,22 @@ class Booru():
 
     def __init__(self, booru, booru_url):
         self.booru = booru
-        self.booru_url = booru_url
+        # Pristine base URL. Per-request URLs are built from this and NEVER
+        # written back, so calling get_data twice on one instance (as the
+        # mix-from-presets path does) can't accumulate stale query params.
+        self._base_url = booru_url
+        self.booru_url = booru_url  # last-built URL, for logging only
         self.headers = {'user-agent': 'my-app/0.0.1'}
+
+    def _request_url(self, extra=''):
+        """Build a request URL from the pristine base without mutating state."""
+        url = f"{self._base_url}{extra}"
+        self.booru_url = url  # record for the (sanitised) debug print only
+        return url
+
+    def _get(self, url):
+        """Single choke point for GETs: always sets headers and a timeout."""
+        return requests.get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
 
     def get_data(self, add_tags, max_pages=10, id=''):
         pass
@@ -182,28 +197,40 @@ class Gelbooru(Booru):
         self.api_key = api_key
         self.user_id = user_id
 
+    def _credentials(self):
+        """Credentials as a params dict, so they are never baked into the
+        logged URL string (self.booru_url) or the requests_cache key text."""
+        if self.api_key and self.user_id:
+            return {'api_key': self.api_key, 'user_id': self.user_id}
+        return {}
+
     def get_data(self, add_tags, max_pages=10, id=''):
         global COUNT
         if id:
             add_tags = ''
 
-        base_url = self.booru_url
-        cred_params = f"&api_key={self.api_key}&user_id={self.user_id}" if self.api_key and self.user_id else ''
+        base_url = self._base_url
+        cookies = {'fringeBenefits': 'yup'} if self.fringeBenefits else None
+        creds = self._credentials()
 
         def fetch(pid):
-            # Build the URL fresh each attempt - never mutate the base
-            url = f"{base_url}&pid={pid}{id}{add_tags}{cred_params}"
-            self.booru_url = url  # kept for the downstream debug print
-            if self.fringeBenefits:
-                res = requests.get(url, cookies={'fringeBenefits': 'yup'})
-            else:
-                res = requests.get(url)
-            return res.json()
+            # Build the URL fresh each attempt - never mutate the base. The
+            # api_key/user_id go through params=, so they do NOT appear in the
+            # URL we store for logging.
+            url = f"{base_url}&pid={pid}{id}{add_tags}"
+            self.booru_url = url  # recorded for the (credential-free) debug print
+            res = requests.get(url, params=creds, cookies=cookies,
+                               headers=self.headers, timeout=REQUEST_TIMEOUT)
+            try:
+                return res.json()
+            except ValueError:
+                print(f"Ranbooru: Gelbooru returned a non-JSON response (status {res.status_code}).")
+                return {}
 
-        # The randint function is an alias to randrange(a, b+1), so 'max_pages' is passed as 'max_pages-1'
+        # randint is randrange(a, b+1), so pass max_pages-1
         pid = random.randint(0, max(0, max_pages - 1))
         data = fetch(pid)
-        COUNT = data.get('@attributes', {}).get('count', 0)
+        COUNT = data.get('@attributes', {}).get('count', 0) if isinstance(data, dict) else 0
 
         # If fewer results exist than the requested page range, re-roll within the actual range
         if COUNT <= max_pages * POST_AMOUNT:
@@ -215,14 +242,20 @@ class Gelbooru(Booru):
         else:
             print(f" Processing {max_pages * POST_AMOUNT} out of {COUNT} results.")
 
-        # If the chosen page came back empty, walk down one page at a time
-        retries = 0
-        while not data.get('post') and pid > 0 and retries < 15:
-            pid -= 1
-            retries += 1
-            print(f"Ranbooru: page {pid + 1} returned no posts, retrying page {pid}")
-            data = fetch(pid)
-        return data
+        # If the chosen page came back empty, re-roll within the known-good
+        # range first, then fall back to a geometric walk-down. A linear
+        # decrement from a high pid (now that Max Pages can be 1000) could
+        # exhaust its retries far from any real results; re-rolling inside
+        # actual_pages lands in the populated range immediately.
+        if not (isinstance(data, dict) and data.get('post')) and COUNT > 0:
+            good_pages = max(1, COUNT // POST_AMOUNT + 1)
+            retries = 0
+            while not (isinstance(data, dict) and data.get('post')) and retries < 8:
+                retries += 1
+                pid = random.randint(0, good_pages - 1)
+                print(f"Ranbooru: empty page, re-rolling within {good_pages} known page(s) (try {retries})")
+                data = fetch(pid)
+        return data if isinstance(data, dict) else {}
 
     def get_post(self, add_tags, max_pages=10, id=''):
         return self.get_data(add_tags, max_pages, "&id=" + id)
@@ -236,18 +269,28 @@ class Gelbooru(Booru):
         if not tag_string or not tag_string.strip():
             return tag_string
         try:
-            tags = tag_string.split(' ')
-            names_param = '%20'.join(tags)
-            url = f"https://gelbooru.com/index.php?page=dapi&s=tag&q=index&json=1&names={names_param}&limit=100"
-            if self.api_key and self.user_id:
-                url += f"&api_key={self.api_key}&user_id={self.user_id}"
-            res = requests.get(url)
-            if res.status_code != 200 or not res.text.strip():
-                print(f"Ranbooru: character tag filter request failed (status {res.status_code}), skipping filter")
-                return tag_string
-            data = res.json()
-            tag_entries = data.get('tag', [])
-            character_names = {entry['name'] for entry in tag_entries if entry.get('type') == 4}
+            tags = [t for t in tag_string.split(' ') if t]
+            base = 'https://gelbooru.com/index.php'
+            cookies = {'fringeBenefits': 'yup'} if self.fringeBenefits else None
+            creds = self._credentials()
+            character_names = set()
+            # The tag API caps at 100 names per request, so page through the
+            # post's tags in chunks of 100 rather than silently dropping the
+            # rest on heavily tagged posts. requests builds the query string,
+            # so tags containing &, +, # or % are encoded correctly.
+            for start in range(0, len(tags), 100):
+                chunk = tags[start:start + 100]
+                params = {
+                    'page': 'dapi', 's': 'tag', 'q': 'index', 'json': '1',
+                    'names': ' '.join(chunk), 'limit': 100, **creds,
+                }
+                res = requests.get(base, params=params, cookies=cookies,
+                                   headers=self.headers, timeout=REQUEST_TIMEOUT)
+                if res.status_code != 200 or not res.text.strip():
+                    print(f"Ranbooru: character tag filter request failed (status {res.status_code}), skipping filter")
+                    return tag_string
+                entries = res.json().get('tag', [])
+                character_names.update(e['name'] for e in entries if e.get('type') == 4)
             if not character_names:
                 return tag_string
             filtered = [t for t in tags if t not in character_names]
@@ -271,9 +314,8 @@ class XBooru(Booru):
         for loop in range(2): # run loop at most twice
             if id:
                 add_tags = ''
-            self.booru_url = f"{self.booru_url}&pid={random.randint(0, max_pages-1)}{id}{add_tags}"
-            print(self.booru_url)
-            res = requests.get(self.booru_url)
+            url = self._request_url(f"&pid={random.randint(0, max_pages-1)}{id}{add_tags}")
+            res = self._get(url)
             data = res.json()
             COUNT = 0
             for post in data:
@@ -307,8 +349,8 @@ class Rule34(Booru):
         for loop in range(2): # run loop at most twice
             if id:
                 add_tags = ''
-            self.booru_url = f"{self.booru_url}&pid={random.randint(0, max_pages-1)}{id}{add_tags}"
-            res = requests.get(self.booru_url)
+            url = self._request_url(f"&pid={random.randint(0, max_pages-1)}{id}{add_tags}")
+            res = self._get(url)
             data = res.json()
             COUNT = len(data)
             if COUNT == 0:
@@ -339,8 +381,8 @@ class Safebooru(Booru):
         for loop in range(2): # run loop at most twice
             if id:
                 add_tags = ''
-            self.booru_url = f"{self.booru_url}&pid={random.randint(0, max_pages-1)}{id}{add_tags}"
-            res = requests.get(self.booru_url)
+            url = self._request_url(f"&pid={random.randint(0, max_pages-1)}{id}{add_tags}")
+            res = self._get(url)
             data = res.json()
             COUNT = 0
             for post in data:
@@ -374,8 +416,8 @@ class Konachan(Booru):
         for loop in range(2): # run loop at most twice
             if id:
                 add_tags = ''
-            self.booru_url = f"{self.booru_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
-            res = requests.get(self.booru_url)
+            url = self._request_url(f"&page={random.randint(0, max_pages-1)}{id}{add_tags}")
+            res = self._get(url)
             data = res.json()
             COUNT = len(data)
             if COUNT == 0:
@@ -406,10 +448,9 @@ class Yandere(Booru):
         for loop in range(2): # run loop at most twice
             if id:
                 add_tags = ''
-            self.booru_url = f"{self.booru_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
-            res = requests.get(self.booru_url)
+            url = self._request_url(f"&page={random.randint(0, max_pages-1)}{id}{add_tags}")
+            res = self._get(url)
             data = res.json()
-            COUNT = len(data)
             COUNT = len(data)
             if COUNT == 0:
                 max_pages = 2
@@ -439,8 +480,8 @@ class AIBooru(Booru):
         for loop in range(2): # run loop at most twice
             if id:
                 add_tags = ''
-            self.booru_url = f"{self.booru_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
-            res = requests.get(self.booru_url)
+            url = self._request_url(f"&page={random.randint(0, max_pages-1)}{id}{add_tags}")
+            res = self._get(url)
             data = res.json()
             for post in data:
                 post['tags'] = post['tag_string']
@@ -473,8 +514,8 @@ class Danbooru(Booru):
         for loop in range(2): # run loop at most twice
             if id:
                 add_tags = ''
-            self.booru_url = f"{self.booru_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
-            res = requests.get(self.booru_url, headers=self.headers)
+            url = self._request_url(f"&page={random.randint(0, max_pages-1)}{id}{add_tags}")
+            res = self._get(url)
             data = res.json()
             for post in data:
                 post['tags'] = post['tag_string']
@@ -493,8 +534,9 @@ class Danbooru(Booru):
         return {'post': data}
 
     def get_post(self, add_tags, max_pages=10, id=''):
-        self.booru_url = f"https://danbooru.donmai.us/posts/{id}.json"
-        res = requests.get(self.booru_url, headers=self.headers)
+        url = f"https://danbooru.donmai.us/posts/{id}.json"
+        self.booru_url = url
+        res = self._get(url)
         data = res.json()
         data['tags'] = data['tag_string']
         data = {'post': [data]}
@@ -504,7 +546,7 @@ class Danbooru(Booru):
 class e621(Booru):
 
     def __init__(self):
-        super().__init__('danbooru', f'https://e621.net/posts.json?limit={POST_AMOUNT}')
+        super().__init__('e621', f'https://e621.net/posts.json?limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id=''):
         global COUNT
@@ -512,8 +554,8 @@ class e621(Booru):
         for loop in range(2): # run loop at most twice
             if id:
                 add_tags = ''
-            self.booru_url = f"{self.booru_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
-            res = requests.get(self.booru_url, headers=self.headers)
+            url = self._request_url(f"&page={random.randint(0, max_pages-1)}{id}{add_tags}")
+            res = self._get(url)
             data = res.json()['posts']
             COUNT = len(data)
             for post in data:
@@ -537,7 +579,7 @@ class e621(Booru):
         return {'post': data}
 
     def get_post(self, add_tags, max_pages=10, id=''):
-        self.get_data(add_tags, max_pages, "&id=" + id)
+        return self.get_data(add_tags, max_pages, "&id=" + id)
 
 
 def generate_chaos(pos_tags, neg_tags, chaos_amount):
@@ -944,11 +986,24 @@ class Script(scripts.Script):
             return segment
         custom = [w.strip() for w in lora_custom_weights.split(',')] if lora_custom_weights.strip() else []
         for l in range(0, lora_amount):
-            lora_weight = 0
+            lora_weight = 0.0
             if l < len(custom) and custom[l] != '':
-                lora_weight = float(custom[l])
-            while lora_weight == 0:
-                lora_weight = round(random.uniform(lora_min, lora_max), 1)
+                try:
+                    lora_weight = float(custom[l])
+                except ValueError:
+                    print(f'Ranbooru: invalid custom LoRA weight "{custom[l]}", using a random weight')
+                    lora_weight = 0.0
+            if lora_weight == 0:
+                # Draw a non-zero random weight, but don't spin forever when the
+                # range is degenerate (min == max == 0, or a zero-width range).
+                for _ in range(20):
+                    lora_weight = round(random.uniform(lora_min, lora_max), 1)
+                    if lora_weight != 0:
+                        break
+                else:
+                    # Range can't produce a non-zero value; fall back so the LoRA
+                    # still applies at a sane weight instead of hanging.
+                    lora_weight = lora_max if lora_max != 0 else (lora_min if lora_min != 0 else 1.0)
             segment += f'<lora:{random.choice(loras)}:{lora_weight}>'
         return segment
 
@@ -973,20 +1028,25 @@ class Script(scripts.Script):
 
     def before_process(self, p, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, filter_character_tags, skip_existing_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, mix_ratio, mix_from_presets, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, lora_folder_2_enabled, lora_folder_2, lora_amount_2, lora_min_2, lora_max_2, lora_custom_weights_2, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_random_preset=False, tag_preset_1='', tag_preset_2='', tag_preset_3='', tag_preset_4='', tag_preset_5='', preset_max_pages_1=0, preset_max_pages_2=0, preset_max_pages_3=0, preset_max_pages_4=0, preset_max_pages_5=0):        # Manage Cache
         if use_cache and not requests_cache.patcher.is_installed():
-            requests_cache.install_cache('ranbooru_cache', backend='sqlite', expire_after=3600)
+            # ignored_parameters keeps api_key/user_id out of the cache key and
+            # out of the cached request records in ranbooru_cache.sqlite.
+            requests_cache.install_cache(
+                'ranbooru_cache', backend='sqlite', expire_after=3600,
+                ignored_parameters=['api_key', 'user_id'])
         elif not use_cache and requests_cache.patcher.is_installed():
             requests_cache.uninstall_cache()
         
         if enabled:
             # Tag Preset: pick a random non-empty preset to override the tags field
             if use_random_preset:
-                presets = [pr for pr in [tag_preset_1, tag_preset_2, tag_preset_3, tag_preset_4, tag_preset_5] if pr.strip()]
-                if presets:
-                    chosen_index = [tag_preset_1, tag_preset_2, tag_preset_3, tag_preset_4, tag_preset_5].index(
-                        random.choice(presets)
-                    )
-                    tags = [tag_preset_1, tag_preset_2, tag_preset_3, tag_preset_4, tag_preset_5][chosen_index]
-                    preset_pages = [preset_max_pages_1, preset_max_pages_2, preset_max_pages_3, preset_max_pages_4, preset_max_pages_5][chosen_index]
+                all_presets = [tag_preset_1, tag_preset_2, tag_preset_3, tag_preset_4, tag_preset_5]
+                all_preset_pages = [preset_max_pages_1, preset_max_pages_2, preset_max_pages_3, preset_max_pages_4, preset_max_pages_5]
+                # Carry the index with the text so duplicate preset strings don't
+                # collapse to the first match's Max Pages override.
+                candidates = [(i, pr) for i, pr in enumerate(all_presets) if pr.strip()]
+                if candidates:
+                    chosen_index, tags = random.choice(candidates)
+                    preset_pages = all_preset_pages[chosen_index]
                     if preset_pages and int(preset_pages) > 0:
                         max_pages = int(preset_pages)
                         print(f'Ranbooru: using random tag preset: "{tags}" with max_pages={max_pages}')
@@ -1126,21 +1186,42 @@ class Script(scripts.Script):
             else:
                 data = api_url.get_data(add_tags, max_pages)
 
-            print(api_url.booru_url)
+            # Normalise to a safe post list. A booru error page may return a dict
+            # with no 'post' key, and an empty search returns an empty list; both
+            # must NOT crash. When there are no posts we skip tag application
+            # entirely but still fall through to LoRAnado below, leaving the
+            # user's prompt untouched.
+            posts = data.get('post') if isinstance(data, dict) else None
+            if not posts:
+                posts = []
+            posts_found = len(posts) > 0
+            data = {'post': posts}
+
+            if not posts_found:
+                print('Ranbooru: no posts found for this search - skipping tag '
+                      'application (LoRAnado and the rest still run). '
+                      'Try lowering Max Pages or changing the tags.')
+
             # Replace null scores with 0s
-            for post in data['post']:
+            for post in posts:
                 post['score'] = post.get('score', 0)
 
             # Sort based on sorting_order
             if sorting_order == 'High Score':
-                data['post'] = sorted(data['post'], key=lambda k: k.get('score', 0), reverse=True)
+                data['post'] = sorted(posts, key=lambda k: k.get('score', 0), reverse=True)
             elif sorting_order == 'Low Score':
-                data['post'] = sorted(data['post'], key=lambda k: k.get('score', 0))
-            if post_id:
+                data['post'] = sorted(posts, key=lambda k: k.get('score', 0))
+            posts = data['post']
+
+            # Index range is the real page length, never the global COUNT.
+            page_len = len(posts)
+            if not posts_found:
+                random_numbers = []
+            elif post_id:
                 print(f'Using post ID: {post_id}')
                 random_numbers = [0 for _ in range(0, p.batch_size * p.n_iter)]
             else:
-                random_numbers = self.random_number(sorting_order, p.batch_size * p.n_iter)
+                random_numbers = self.random_number(sorting_order, p.batch_size * p.n_iter, count=page_len)
             for random_number in random_numbers:
                 if same_prompt:
                     random_post = data['post'][random_numbers[0]]
@@ -1150,15 +1231,20 @@ class Script(scripts.Script):
                         # sources 2+ from the preset-mix pool when available
                         source_tag_lists = []
                         for mix_i in range(0, mix_amount):
-                            if mix_i > 0 and preset_mix_data is not None:
+                            if mix_i > 0 and preset_mix_data is not None and preset_mix_data.get('post'):
                                 pool = preset_mix_data['post']
                                 random_mix_number = random.randint(0, len(pool) - 1)
                             else:
                                 pool = data['post']
+                                if not pool:
+                                    continue
                                 if post_id:
                                     random_mix_number = random_number
                                 else:
-                                    random_mix_number = self.random_number(sorting_order, 1)[0]
+                                    picks = self.random_number(sorting_order, 1, count=len(pool))
+                                    if not picks:
+                                        continue
+                                    random_mix_number = picks[0]
                             tag_list = [t for t in pool[random_mix_number]['tags'].split(' ') if t.strip()]
                             if tag_list:
                                 source_tag_lists.append(tag_list)
@@ -1191,8 +1277,9 @@ class Script(scripts.Script):
                         try:
                             random_post = data['post'][random_number]
                         except IndexError:
-                            raise Exception(
-                                "No posts found with those tags. Try lowering the pages or changing the tags.")
+                            # Index landed past the fetched page. Skip this one
+                            # rather than aborting the whole generation.
+                            continue
                 # Filter character tags (Gelbooru only) - only on the selected post
                 post_tags = random_post['tags']
                 if filter_character_tags and isinstance(api_url, Gelbooru):
@@ -1204,12 +1291,12 @@ class Script(scripts.Script):
                 # Debug picture
                 if DEBUG:
                     print(random_post)
-            # Get Images
-            if use_img2img or use_deepbooru:
-                image_urls = [random_post['file_url']] if use_last_img else preview_urls
+            # Get Images (only when we actually selected posts)
+            if posts_found and prompts and (use_img2img or use_deepbooru):
+                image_urls = [preview_urls[-1]] if use_last_img else preview_urls
 
                 for img in image_urls:
-                    response = requests.get(img, headers=api_url.headers)
+                    response = requests.get(img, headers=api_url.headers, timeout=REQUEST_TIMEOUT)
                     last_img.append(Image.open(BytesIO(response.content)))
             new_prompts = []
             # Cleaning Tags
@@ -1249,7 +1336,11 @@ class Script(scripts.Script):
                     if total_removed:
                         print(f'Ranbooru: skipped {total_removed} tag(s) already in the prompt')
 
-            if len(prompts) == 1:
+            if not prompts:
+                # No tags were applied (empty search). Leave p.prompt as the
+                # user wrote it and fall through to LoRAnado / the rest.
+                print('Ranbooru: no booru tags applied; keeping the original prompt.')
+            elif len(prompts) == 1:
                 print('Processing Single Prompt')
                 p.prompt = f"{p.prompt},{prompts[-1]}" if p.prompt else prompts[-1]
                 if chaos_mode in ['Chaos', 'Less Chaos']:
@@ -1334,7 +1425,11 @@ class Script(scripts.Script):
 
             # LORANADO
             p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev, lora_folder_2_enabled, lora_folder_2, lora_amount_2, lora_min_2, lora_max_2, lora_custom_weights_2)
-            if use_deepbooru and not use_img2img:
+            # Deepbooru only runs when the model is actually available. If it
+            # isn't, skip the modify step entirely rather than letting the
+            # fallback feed the bare original prompt into modify_prompt, which
+            # in 'Replace' mode would discard the booru tags we just fetched.
+            if use_deepbooru and not use_img2img and deepbooru is not None:
                 self.last_img = last_img
                 tagged_prompts = self.use_autotagger('deepbooru')
 
@@ -1343,7 +1438,9 @@ class Script(scripts.Script):
                     p.prompt = [remove_repeated_tags(pr) for pr in p.prompt]
                 else:
                     p.prompt = modify_prompt(p.prompt, tagged_prompts, type_deepbooru)
-                    p.prompt = remove_repeated_tags(p.prompt[0])
+                    p.prompt = remove_repeated_tags(p.prompt[0] if isinstance(p.prompt, list) else p.prompt)
+            elif use_deepbooru and not use_img2img and deepbooru is None:
+                print('Ranbooru: Deepbooru unavailable; keeping booru tags as-is.')
 
             if use_img2img:
                 if not use_ip:
@@ -1409,26 +1506,40 @@ class Script(scripts.Script):
                     processed.images.append(img)
                     processed.infotexts.append(proc.infotexts[num + 1])
 
-    def random_number(self, sorting_order, size):
-        """Generates random numbers based on the sorting_order
+    def random_number(self, sorting_order, size, count=None):
+        """Generates random indices into the fetched page.
 
         Args:
             sorting_order (str): the sorting order. It can be 'Random', 'High Score' or 'Low Score'
             size (int): the amount of random numbers to generate
+            count (int, optional): the number of posts actually available on the
+                fetched page. When given, indices are drawn from this range rather
+                than the global COUNT. For Gelbooru, COUNT is the total hit count
+                (which can far exceed the posts on one page), so passing the real
+                page length here prevents out-of-range indices. Falls back to the
+                global COUNT when not supplied.
 
         Returns:
-            list: the random numbers
+            list: the random indices (may be fewer than `size` if the page is small)
         """
         global COUNT
-        if COUNT > POST_AMOUNT: # Modified to use COUNT instead of POST_AMOUNT
-            COUNT = POST_AMOUNT # If there are more than 100 images, use POST_AMOUNT
-        weights = np.arange(COUNT, 0, -1)
-        weights = weights / weights.sum()
-        if sorting_order in ('High Score', 'Low Score'):
-            random_numbers = np.random.choice(np.arange(COUNT), size=size, p=weights, replace=False)
+        n = count if count is not None else COUNT
+        if n is None:
+            n = 0
+        # Never index past what the page actually holds.
+        n = min(n, POST_AMOUNT)
+        if n <= 0:
+            return []
+        # Sampling without replacement cannot return more than n distinct indices.
+        draw = min(size, n)
+        weights = np.arange(n, 0, -1)
+        total = weights.sum()
+        if sorting_order in ('High Score', 'Low Score') and total > 0:
+            weights = weights / total
+            random_numbers = np.random.choice(np.arange(n), size=draw, p=weights, replace=False)
         else:
-            random_numbers = random.sample(range(COUNT), size)
-        return random_numbers
+            random_numbers = random.sample(range(n), draw)
+        return list(random_numbers)
 
     def use_autotagger(self, model):
         """Use the autotagger to tag the images

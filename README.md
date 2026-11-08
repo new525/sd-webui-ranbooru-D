@@ -34,18 +34,20 @@ This fork diverges from [Inzaniak/sd-webui-ranbooru](https://github.com/Inzaniak
 - **Max Pages ceiling raised** to 1000 (was 100), matching what the preset Max Pages fields already allowed.
 - **Gelbooru API credentials UI** — enter and optionally save your Gelbooru API key / user ID; saved credentials are hidden in the UI and can be cleared. (Gelbooru has required an API key + user ID since June 2025.)
 
-### Behaviour changes
-- **Mix prompts rewritten** to take an equal share from each source post, to copy the post dict before mutating its tags (fixing a real cache-poisoning bug where mixed tags leaked into the cached page), and to filter out empty/whitespace tags.
-- **Page walk-down (partial).** When a Gelbooru fetch lands on an empty page, `get_data` steps the page index down and retries up to 15 times before giving up. This reduces — but does not eliminate — empty-result errors; a random page far past a booru's real result window can still exhaust the retries and surface the upstream "no posts found" error. See [Known limitations](#known-limitations-in-this-fork).
+### Behaviour fixes
+- **Empty searches no longer crash and no longer skip LoRAnado.** A search returning no posts — a booru error page with no `post` key, an empty result, or an exhausted page walk-down — now skips only the tag-application step, leaves your prompt as written, and still runs LoRAnado and the rest of the pass. (Previously this raised and aborted.)
+- **Index range taken from the fetched page, not the global hit count.** For Gelbooru, the total hit count can far exceed the posts on one page; indices are now drawn from the actual page length, fixing an `IndexError` on small/late pages and the `ValueError`/`NaN` crashes on empty pages.
+- **All boorus build request URLs without mutating state.** The base class now builds each request URL from a pristine base and passes credentials via `params=`. This fixes **mix-from-presets on every booru** (previously the two fetches it performs corrupted the URL on the eight non-Gelbooru classes), and removes the duplicated-query-parameter problem generally.
+- **Request timeouts everywhere.** Every booru request now has a timeout, so a stalled booru can't hang generation indefinitely.
+- **Gelbooru credentials kept out of logs and cache.** `api_key`/`user_id` now travel as request params rather than in the URL string, the credential-bearing URL print was removed, and the request cache ignores those parameters so they aren't written into `ranbooru_cache.sqlite`.
+- **Page walk-down re-rolls within the known-good range** instead of linearly decrementing from a possibly-distant page, so an empty page past a booru's result window recovers in a few tries rather than exhausting retries.
+- **Mix prompts** takes an equal share from each source post, copies the post dict before mutating tags (fixing a cache-poisoning bug), and filters empty/whitespace tags.
 
-### Known limitations in this fork
-These are real issues identified in review and **not yet fixed** at this commit. They are documented here rather than hidden:
-- **Empty results can still raise.** The fork does not wrap the fetch/select block, so a search that returns no posts (a Gelbooru API error page, an empty booru result, or a walk-down that exhausts its retries) raises an exception instead of falling through — which means LoRAnado does not run on those passes. An earlier development build had a graceful fallthrough; it is not present in this commit.
-- **Mix-from-presets corrupts URLs on non-Gelbooru boorus.** Only the Gelbooru class rebuilds its request URL per call; the other booru classes still append to a stored URL in place, so the two fetches mix-from-presets performs on a non-Gelbooru instance can produce a malformed query. Use mix-from-presets with Gelbooru only for now.
-- **No request timeouts.** A stalled booru request can hang generation indefinitely.
-- **Gelbooru credentials appear in the console log.** The fetched URL (including `api_key`/`user_id` for Gelbooru) is printed to the WebUI console and is used as the request-cache key. The saved `credentials.json` itself is gitignored, but treat your console output and `ranbooru_cache.sqlite` as sensitive until this is fixed.
-
-A follow-up commit is planned to address these.
+### Smaller fixes
+- LoRAnado: invalid custom weights no longer throw, and a degenerate weight range (e.g. min = max = 0) no longer spins forever.
+- Deepbooru: when the model is unavailable the modify step is skipped rather than discarding the fetched booru tags.
+- Preset selection no longer collapses duplicate preset text to the first entry's Max Pages override.
+- Assorted upstream cleanups (e621 class/name and `get_post` return, duplicated `COUNT` line in Yandere).
 
 > **Note on the companion State extension:** if you use `sd-webui-state` to persist panel settings, clear the `state-ext-ranbooru-*` keys from `localStorage` (or re-set the controls once) after updating. These additions inserted new controls into the middle of the panel's control list, which shifts the positional indices State uses; appending them at the end would have avoided the break, and a future version may re-order them to restore compatibility.
 
