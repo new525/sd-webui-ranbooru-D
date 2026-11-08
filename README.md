@@ -46,6 +46,9 @@ This fork diverges from [Inzaniak/sd-webui-ranbooru](https://github.com/Inzaniak
 ### Smaller fixes
 - LoRAnado: invalid custom weights no longer throw, and a degenerate weight range (e.g. min = max = 0) no longer spins forever.
 - Deepbooru: when the model is unavailable the modify step is skipped rather than discarding the fetched booru tags.
+- **Deepbooru per-image tagging actually works now.** The autotagger rewrote `final_prompts` from scratch on every outer loop and reused a single base prompt, so only the last image's result survived and all shared one prompt; each image now pairs with its own base prompt and its own tags. The single-image path also no longer passes the first *character* of the prompt to the de-duplicator.
+- **Mix mode now pairs the img2img seed image with the mix.** The first mix source is the base post whose image is used for img2img, so the seed image corresponds to tags that actually went into the prompt (previously it came from an unrelated post).
+- **Caching no longer affects other extensions.** The extension used `requests_cache.install_cache()`, which monkeypatches `requests` globally for the entire WebUI process; it now uses a dedicated `CachedSession` for booru requests only. Credentials remain excluded from the cache.
 - Preset selection no longer collapses duplicate preset text to the first entry's Max Pages override.
 - Assorted upstream cleanups (e621 class/name and `get_post` return, duplicated `COUNT` line in Yandere).
 

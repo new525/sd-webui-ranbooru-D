@@ -105,6 +105,40 @@ POST_AMOUNT = 100
 COUNT = 100 #Number of images the search returned. Booru classes below were modified to update this value with the latest search result count.
 DEBUG = False
 REQUEST_TIMEOUT = 20  # seconds; prevents a stalled booru from hanging generation
+
+# Booru requests go through a dedicated CachedSession rather than
+# requests_cache.install_cache(), which would monkeypatch `requests` globally
+# for the whole WebUI process (every other extension included). The session is
+# created on demand when the user enables "Use cache" and torn down when they
+# disable it; while disabled, _booru_requester() returns the plain `requests`
+# module so fetches are uncached but still go out normally.
+_BOORU_SESSION = None
+
+
+def enable_booru_cache(enabled):
+    """Create or tear down the booru-only cached session."""
+    global _BOORU_SESSION
+    if enabled:
+        if _BOORU_SESSION is None:
+            _BOORU_SESSION = requests_cache.CachedSession(
+                'ranbooru_cache',
+                backend='sqlite',
+                expire_after=3600,
+                ignored_parameters=['api_key', 'user_id'],
+            )
+    else:
+        if _BOORU_SESSION is not None:
+            try:
+                _BOORU_SESSION.close()
+            except Exception:
+                pass
+            _BOORU_SESSION = None
+
+
+def _booru_requester():
+    """Return the cached session if caching is on, else the plain requests module.
+    Both expose a compatible .get(), so call sites don't change shape."""
+    return _BOORU_SESSION if _BOORU_SESSION is not None else requests
 RATING_TYPES = {
     "none": {
         "All": "All"
@@ -179,8 +213,9 @@ class Booru():
         return url
 
     def _get(self, url):
-        """Single choke point for GETs: always sets headers and a timeout."""
-        return requests.get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
+        """Single choke point for GETs: always sets headers and a timeout, and
+        routes through the booru cache session when caching is enabled."""
+        return _booru_requester().get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
 
     def get_data(self, add_tags, max_pages=10, id=''):
         pass
@@ -219,8 +254,8 @@ class Gelbooru(Booru):
             # URL we store for logging.
             url = f"{base_url}&pid={pid}{id}{add_tags}"
             self.booru_url = url  # recorded for the (credential-free) debug print
-            res = requests.get(url, params=creds, cookies=cookies,
-                               headers=self.headers, timeout=REQUEST_TIMEOUT)
+            res = _booru_requester().get(url, params=creds, cookies=cookies,
+                                         headers=self.headers, timeout=REQUEST_TIMEOUT)
             try:
                 return res.json()
             except ValueError:
@@ -284,8 +319,8 @@ class Gelbooru(Booru):
                     'page': 'dapi', 's': 'tag', 'q': 'index', 'json': '1',
                     'names': ' '.join(chunk), 'limit': 100, **creds,
                 }
-                res = requests.get(base, params=params, cookies=cookies,
-                                   headers=self.headers, timeout=REQUEST_TIMEOUT)
+                res = _booru_requester().get(base, params=params, cookies=cookies,
+                                             headers=self.headers, timeout=REQUEST_TIMEOUT)
                 if res.status_code != 200 or not res.text.strip():
                     print(f"Ranbooru: character tag filter request failed (status {res.status_code}), skipping filter")
                     return tag_string
@@ -1027,15 +1062,10 @@ class Script(scripts.Script):
         return p
 
     def before_process(self, p, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, filter_character_tags, skip_existing_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, mix_ratio, mix_from_presets, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, lora_folder_2_enabled, lora_folder_2, lora_amount_2, lora_min_2, lora_max_2, lora_custom_weights_2, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_random_preset=False, tag_preset_1='', tag_preset_2='', tag_preset_3='', tag_preset_4='', tag_preset_5='', preset_max_pages_1=0, preset_max_pages_2=0, preset_max_pages_3=0, preset_max_pages_4=0, preset_max_pages_5=0):        # Manage Cache
-        if use_cache and not requests_cache.patcher.is_installed():
-            # ignored_parameters keeps api_key/user_id out of the cache key and
-            # out of the cached request records in ranbooru_cache.sqlite.
-            requests_cache.install_cache(
-                'ranbooru_cache', backend='sqlite', expire_after=3600,
-                ignored_parameters=['api_key', 'user_id'])
-        elif not use_cache and requests_cache.patcher.is_installed():
-            requests_cache.uninstall_cache()
-        
+        # Toggle the booru-only cache session. Unlike install_cache(), this does
+        # not patch requests globally, so other extensions' HTTP is untouched.
+        enable_booru_cache(use_cache)
+
         if enabled:
             # Tag Preset: pick a random non-empty preset to override the tags field
             if use_random_preset:
@@ -1227,11 +1257,21 @@ class Script(scripts.Script):
                     random_post = data['post'][random_numbers[0]]
                 else:
                     if mix_prompt:
-                        # Gather tag lists: source 1 from the primary pool,
-                        # sources 2+ from the preset-mix pool when available
+                        # Gather tag lists for mixing. Source 0 is THIS iteration's
+                        # base post (random_number) so that the init image we later
+                        # use (random_post.file_url) is one of the posts whose tags
+                        # actually went into the mix - fixing the mismatch where the
+                        # img2img seed image came from a post whose tags were unused.
+                        # Sources 1+ come from the preset-mix pool when available,
+                        # otherwise from further random posts in the primary pool.
                         source_tag_lists = []
                         for mix_i in range(0, mix_amount):
-                            if mix_i > 0 and preset_mix_data is not None and preset_mix_data.get('post'):
+                            if mix_i == 0:
+                                pool = data['post']
+                                if not pool:
+                                    continue
+                                random_mix_number = random_number
+                            elif preset_mix_data is not None and preset_mix_data.get('post'):
                                 pool = preset_mix_data['post']
                                 random_mix_number = random.randint(0, len(pool) - 1)
                             else:
@@ -1245,6 +1285,8 @@ class Script(scripts.Script):
                                     if not picks:
                                         continue
                                     random_mix_number = picks[0]
+                            if random_mix_number >= len(pool):
+                                continue
                             tag_list = [t for t in pool[random_mix_number]['tags'].split(' ') if t.strip()]
                             if tag_list:
                                 source_tag_lists.append(tag_list)
@@ -1432,13 +1474,22 @@ class Script(scripts.Script):
             if use_deepbooru and not use_img2img and deepbooru is not None:
                 self.last_img = last_img
                 tagged_prompts = self.use_autotagger('deepbooru')
+                # use_autotagger always returns a list (one entry per image).
+                if not isinstance(tagged_prompts, list):
+                    tagged_prompts = [tagged_prompts]
 
                 if isinstance(p.prompt, list):
-                    p.prompt = [modify_prompt(pr, tagged_prompts[num], type_deepbooru) for num, pr in enumerate(p.prompt)]
-                    p.prompt = [remove_repeated_tags(pr) for pr in p.prompt]
+                    p.prompt = [
+                        remove_repeated_tags(
+                            modify_prompt(pr, tagged_prompts[num] if num < len(tagged_prompts) else tagged_prompts[-1], type_deepbooru)
+                        )
+                        for num, pr in enumerate(p.prompt)
+                    ]
                 else:
-                    p.prompt = modify_prompt(p.prompt, tagged_prompts, type_deepbooru)
-                    p.prompt = remove_repeated_tags(p.prompt[0] if isinstance(p.prompt, list) else p.prompt)
+                    # Single prompt: pair with the first tagged result (a string),
+                    # not the whole list, and don't index into the string itself.
+                    tagged = tagged_prompts[0] if tagged_prompts else ''
+                    p.prompt = remove_repeated_tags(modify_prompt(p.prompt, tagged, type_deepbooru))
             elif use_deepbooru and not use_img2img and deepbooru is None:
                 print('Ranbooru: Deepbooru unavailable; keeping booru tags as-is.')
 
@@ -1557,9 +1608,13 @@ class Script(scripts.Script):
             if isinstance(self.original_prompt, str):
                 orig_prompt = [self.original_prompt]
             else:
-                orig_prompt = self.original_prompt
+                orig_prompt = list(self.original_prompt)
+            # Pair each image with a base prompt. When there are more images
+            # than base prompts (a batch sharing one prompt), reuse the first.
             deepbooru.model.start()
-            for img, prompt in zip(self.last_img, orig_prompt):
-                final_prompts = [prompt + ',' + deepbooru.model.tag_multi(img) for img in self.last_img]
+            final_prompts = []
+            for i, img in enumerate(self.last_img):
+                base = orig_prompt[i] if i < len(orig_prompt) else orig_prompt[0]
+                final_prompts.append(base + ',' + deepbooru.model.tag_multi(img))
             deepbooru.model.stop()
             return final_prompts
