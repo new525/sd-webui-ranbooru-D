@@ -172,8 +172,9 @@ RATINGS = {
 
 
 def get_available_ratings(booru):
-    # gr.update (not gr.Radio.update) - the class-method form was removed in
-    # Gradio 4.x, which Forge Neo uses. list() the keys so choices is concrete.
+    # gr.update (not gr.Radio.update): the component .update() class-methods
+    # were removed in Gradio 4.0, so gr.update is the form that works on the
+    # 4.x line. list() the keys so choices is a concrete list.
     return gr.update(choices=list(RATINGS[booru].keys()), value="All")
 
 
@@ -203,7 +204,9 @@ class Booru():
         # mix-from-presets path does) can't accumulate stale query params.
         self._base_url = booru_url
         self.booru_url = booru_url  # last-built URL, for logging only
-        self.headers = {'user-agent': 'my-app/0.0.1'}
+        # Descriptive user agent. e621 (and others) may block generic agents
+        # per their API terms; identify the fork and point to the repo.
+        self.headers = {'user-agent': 'sd-webui-ranbooru-D/1.3 (+github.com/new525/sd-webui-ranbooru-D)'}
 
     def _request_url(self, extra=''):
         """Build a request URL from the pristine base without mutating state."""
@@ -282,13 +285,24 @@ class Gelbooru(Booru):
         # exhaust its retries far from any real results; re-rolling inside
         # actual_pages lands in the populated range immediately.
         if not (isinstance(data, dict) and data.get('post')) and COUNT > 0:
-            good_pages = max(1, COUNT // POST_AMOUNT + 1)
+            # Geometric narrowing: COUNT can imply thousands of pages, but a
+            # booru may refuse to serve pages past some ceiling below that
+            # (Gelbooru's result window). Re-rolling uniformly across all
+            # COUNT-implied pages would keep landing past that ceiling. Instead,
+            # halve the upper bound on each empty hit so the search range
+            # converges on the real serveable ceiling in ~log2(pages) tries.
+            upper = max(1, COUNT // POST_AMOUNT + 1)
             retries = 0
-            while not (isinstance(data, dict) and data.get('post')) and retries < 8:
+            while not (isinstance(data, dict) and data.get('post')) and retries < 12 and upper > 1:
                 retries += 1
-                pid = random.randint(0, good_pages - 1)
-                print(f"Ranbooru: empty page, re-rolling within {good_pages} known page(s) (try {retries})")
+                pid = random.randint(0, upper - 1)
+                print(f"Ranbooru: empty page, searching within first {upper} page(s) (try {retries})")
                 data = fetch(pid)
+                if not (isinstance(data, dict) and data.get('post')):
+                    upper = max(1, upper // 2)
+            # Final attempt at page 0, which almost always has results.
+            if not (isinstance(data, dict) and data.get('post')):
+                data = fetch(0)
         return data if isinstance(data, dict) else {}
 
     def get_post(self, add_tags, max_pages=10, id=''):
@@ -747,7 +761,7 @@ class Script(scripts.Script):
     previous_loras = ''
     last_img = []
     real_steps = 0
-    version = "1.2"
+    version = "1.3"
     original_prompt = ''
 
     def get_files(self, path):
@@ -929,38 +943,38 @@ class Script(scripts.Script):
             with gr.Group():
                 with gr.Accordion("File", open=False):
                     use_search_txt = gr.Checkbox(label="Use tags_search.txt", value=False)
-                    choose_search_txt = gr.Dropdown(self.get_files(user_search_dir), label="Choose tags_search.txt", value="")
+                    choose_search_txt = gr.Dropdown(self.get_files(user_search_dir), label="Choose tags_search.txt", value=None)
                     search_refresh_btn = gr.Button("Refresh")
                     use_remove_txt = gr.Checkbox(label="Use tags_remove.txt", value=False)
-                    choose_remove_txt = gr.Dropdown(self.get_files(user_remove_dir), label="Choose tags_remove.txt", value="")
+                    choose_remove_txt = gr.Dropdown(self.get_files(user_remove_dir), label="Choose tags_remove.txt", value=None)
                     remove_refresh_btn = gr.Button("Refresh")
             with gr.Group():
                 with gr.Accordion("Extra", open=False):
-                    with gr.Box():
+                    with gr.Group():
                         mix_prompt = gr.Checkbox(label="Mix prompts", value=False)
                         mix_amount = gr.Slider(value=2, label="Mix amount", minimum=2, maximum=10, step=1)
                         mix_ratio = gr.Slider(value=0.5, label="Mix ratio", minimum=0.0, maximum=1.0, step=0.05, info="0 = all tags from image 1, 1 = all tags from image 2, 0.5 = even split")
                         mix_from_presets = gr.Checkbox(label="Mix from presets", value=False, interactive=False, info="Image 2 is drawn from a random Tag Preset's search. Requires random presets enabled.")
                         use_random_preset.change(fn=lambda x: gr.update(interactive=x, value=False) if not x else gr.update(interactive=True), inputs=[use_random_preset], outputs=[mix_from_presets])
-                    with gr.Box():
+                    with gr.Group():
                         chaos_mode = gr.Radio(["None", "Chaos", "Less Chaos"], label="Chaos Mode", value="None")
                         chaos_amount = gr.Slider(value=0.5, label="Chaos Amount %", minimum=0.1, maximum=1, step=0.05)
-                    with gr.Box():
+                    with gr.Group():
                         negative_mode = gr.Radio(["None", "Negative"], label="Negative Mode", value="None")
                         use_same_seed = gr.Checkbox(label="Use same seed for all pictures", value=False)
-                    with gr.Box():
+                    with gr.Group():
                         use_cache = gr.Checkbox(label="Use cache", value=True)
         with InputAccordion(False, label="LoRAnado", elem_id=self.elem_id("lo_enable")) as lora_enabled:
-            with gr.Box():
+            with gr.Group():
                 lora_lock_prev = gr.Checkbox(label="Lock previous LoRAs", value=False)
                 lora_folder = gr.Textbox(lines=1, label="LoRAs Subfolder")
                 lora_amount = gr.Slider(value=1, label="LoRAs Amount", minimum=1, maximum=10, step=1)
-            with gr.Box():
+            with gr.Group():
                 lora_min = gr.Slider(value=-1.0, label="Min LoRAs Weight", minimum=-2.0, maximum=2.0, step=0.1)
                 lora_max = gr.Slider(value=1.0, label="Max LoRAs Weight", minimum=-2.0, maximum=2.0, step=0.1)
                 lora_custom_weights = gr.Textbox(lines=1, label="LoRAs Custom Weights")
             lora_folder_2_enabled = gr.Checkbox(label="Enable second LoRA folder", value=False)
-            with gr.Box(visible=False) as lora_folder_2_group:
+            with gr.Group(visible=False) as lora_folder_2_group:
                 lora_folder_2 = gr.Textbox(lines=1, label="LoRAs Subfolder 2")
                 lora_amount_2 = gr.Slider(value=1, label="LoRAs Amount 2", minimum=1, maximum=10, step=1)
                 lora_min_2 = gr.Slider(value=-1.0, label="Min LoRAs Weight 2", minimum=-2.0, maximum=2.0, step=0.1)
@@ -1136,8 +1150,13 @@ class Script(scripts.Script):
             else:
                 bad_tags.append(remove_tags)
 
-            if use_remove_txt:
-                bad_tags.extend(open(os.path.join(user_remove_dir, choose_remove_txt), 'r').read().split(','))
+            if use_remove_txt and choose_remove_txt:
+                remove_path = os.path.join(user_remove_dir, choose_remove_txt)
+                if os.path.isfile(remove_path):
+                    with open(remove_path, 'r', encoding='utf-8') as f:
+                        bad_tags.extend(f.read().split(','))
+                else:
+                    print(f'Ranbooru: remove-tags file "{choose_remove_txt}" not found, skipping.')
 
             # Manage Backgrounds
             background_options = {
@@ -1165,14 +1184,18 @@ class Script(scripts.Script):
                 else:
                     p.prompt = f'{p.prompt},{color_option}' if p.prompt else color_option
 
-            if use_search_txt:
-                search_tags = open(os.path.join(user_search_dir, choose_search_txt), 'r').read()
+            search_path = os.path.join(user_search_dir, choose_search_txt) if choose_search_txt else None
+            if use_search_txt and search_path and os.path.isfile(search_path):
+                with open(search_path, 'r', encoding='utf-8') as f:
+                    search_tags = f.read()
                 search_tags_r = search_tags.replace(" ", "")
                 split_tags = search_tags_r.splitlines()
                 filtered_tags = [line for line in split_tags if line.strip()]
-                rand_selected = random.randint(0, len(filtered_tags) - 1)
-                selected_tags = filtered_tags[rand_selected]
-                tags = f'{tags},{selected_tags}' if tags else selected_tags
+                if filtered_tags:
+                    selected_tags = random.choice(filtered_tags)
+                    tags = f'{tags},{selected_tags}' if tags else selected_tags
+            elif use_search_txt and choose_search_txt:
+                print(f'Ranbooru: search-tags file "{choose_search_txt}" not found, skipping.')
 
             add_tags = '&tags=-animated'
             if tags:
@@ -1344,8 +1367,19 @@ class Script(scripts.Script):
                 image_urls = [preview_urls[-1]] if use_last_img else preview_urls
 
                 for img in image_urls:
-                    response = requests.get(img, headers=api_url.headers, timeout=REQUEST_TIMEOUT)
-                    last_img.append(Image.open(BytesIO(response.content)))
+                    try:
+                        response = requests.get(img, headers=api_url.headers, timeout=REQUEST_TIMEOUT)
+                        response.raise_for_status()
+                        # Image.open is lazy; load() now so a truncated or non-image
+                        # body (404 page, HTML interstitial) raises here where we can
+                        # catch it, not deep in processing.
+                        im = Image.open(BytesIO(response.content))
+                        im.load()
+                        last_img.append(im)
+                    except Exception as e:
+                        print(f'Ranbooru: could not load image {img} ({e}); skipping it.')
+                # Everything downstream already tolerates an empty/short last_img
+                # (the img2img gate in before_process and postprocess).
             new_prompts = []
             # Cleaning Tags
             for prompt in prompts:
@@ -1384,6 +1418,16 @@ class Script(scripts.Script):
                     if total_removed:
                         print(f'Ranbooru: skipped {total_removed} tag(s) already in the prompt')
 
+            # Pad the prompt list to one entry per generated image. A short page
+            # (fewer posts than batch_size * n_iter) otherwise yields fewer
+            # prompts than images, leaving p.prompt shorter than p.seed /
+            # p.negative_prompt - which the WebUI either errors on or silently
+            # drops images for. Cycle the available prompts to fill. (The
+            # single-prompt case is handled by the len == 1 branch below.)
+            total_images = p.batch_size * p.n_iter
+            if len(prompts) > 1 and len(prompts) < total_images:
+                prompts = [prompts[i % len(prompts)] for i in range(total_images)]
+
             if not prompts:
                 # No tags were applied (empty search). Leave p.prompt as the
                 # user wrote it and fall through to LoRAnado / the rest.
@@ -1416,9 +1460,9 @@ class Script(scripts.Script):
                 else:
                     p.negative_prompt = [p.negative_prompt for _ in range(0, p.batch_size * p.n_iter)]
                 p.prompt = prompts if not p.prompt else [f"{p.prompt},{prompt}" for prompt in prompts]
-                if use_img2img:
+                if use_img2img and last_img:
                     if len(last_img) < p.batch_size * p.n_iter:
-                        last_img = [last_img[0] for _ in range(0, p.batch_size * p.n_iter)]
+                        last_img = [last_img[i % len(last_img)] for i in range(p.batch_size * p.n_iter)]
             if negative_mode == 'Negative':
                 # remove tags from p.prompt using tags from the original prompt
                 orig_list = self.original_prompt.split(',')
@@ -1479,29 +1523,21 @@ class Script(scripts.Script):
             # isn't, skip the modify step entirely rather than letting the
             # fallback feed the bare original prompt into modify_prompt, which
             # in 'Replace' mode would discard the booru tags we just fetched.
-            if use_deepbooru and not use_img2img and deepbooru is not None:
+            if use_deepbooru and not use_img2img:
                 self.last_img = last_img
-                tagged_prompts = self.use_autotagger('deepbooru')
-                # use_autotagger always returns a list (one entry per image).
-                if not isinstance(tagged_prompts, list):
-                    tagged_prompts = [tagged_prompts]
+                p.prompt = self.apply_deepbooru(p.prompt, type_deepbooru)
 
-                if isinstance(p.prompt, list):
-                    p.prompt = [
-                        remove_repeated_tags(
-                            modify_prompt(pr, tagged_prompts[num] if num < len(tagged_prompts) else tagged_prompts[-1], type_deepbooru)
-                        )
-                        for num, pr in enumerate(p.prompt)
-                    ]
-                else:
-                    # Single prompt: pair with the first tagged result (a string),
-                    # not the whole list, and don't index into the string itself.
-                    tagged = tagged_prompts[0] if tagged_prompts else ''
-                    p.prompt = remove_repeated_tags(modify_prompt(p.prompt, tagged, type_deepbooru))
-            elif use_deepbooru and not use_img2img and deepbooru is None:
-                print('Ranbooru: Deepbooru unavailable; keeping booru tags as-is.')
-
-            if use_img2img:
+            if use_img2img and not last_img:
+                # Empty search (or all image downloads failed): there is no seed
+                # image to work from. Skip the img2img / ControlNet handoff and
+                # leave p.steps alone, so the generation still runs normally as
+                # txt2img instead of silently running at 1 step or crashing on
+                # last_img[0] later. Clear any stale images from a previous run
+                # so postprocess's guard doesn't pick them up.
+                self.last_img = []
+                print('Ranbooru: img2img/ControlNet requested but no images were '
+                      'retrieved; running as a normal generation.')
+            elif use_img2img:
                 if not use_ip:
                     self.real_steps = p.steps
                     p.steps = 1
@@ -1521,7 +1557,7 @@ class Script(scripts.Script):
             p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev, lora_folder_2_enabled, lora_folder_2, lora_amount_2, lora_min_2, lora_max_2, lora_custom_weights_2)
 
     def postprocess(self, p, processed, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, filter_character_tags, skip_existing_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, mix_ratio, mix_from_presets, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, lora_folder_2_enabled, lora_folder_2, lora_amount_2, lora_min_2, lora_max_2, lora_custom_weights_2, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_random_preset=False, tag_preset_1='', tag_preset_2='', tag_preset_3='', tag_preset_4='', tag_preset_5='', preset_max_pages_1=0, preset_max_pages_2=0, preset_max_pages_3=0, preset_max_pages_4=0, preset_max_pages_5=0):
-        if use_img2img and not use_ip and enabled:
+        if use_img2img and not use_ip and enabled and getattr(self, 'last_img', None):
             print('Using pictures')
             if crop_center:
                 width, height = p.width, p.height
@@ -1530,13 +1566,7 @@ class Script(scripts.Script):
                 width, height = self.check_orientation(self.last_img[0])
             final_prompts = p.prompt
             if use_deepbooru:
-                tagged_prompts = self.use_autotagger('deepbooru')
-                if isinstance(p.prompt, list):
-                    final_prompts = [modify_prompt(pr, tagged_prompts[num], type_deepbooru) for num, pr in enumerate(p.prompt)]
-                    final_prompts = [remove_repeated_tags(pr) for pr in final_prompts]
-                else:
-                    final_prompts = modify_prompt(p.prompt, tagged_prompts, type_deepbooru)
-                    final_prompts = remove_repeated_tags(final_prompts)
+                final_prompts = self.apply_deepbooru(p.prompt, type_deepbooru)
             p = StableDiffusionProcessingImg2Img(
                 sd_model=shared.sd_model,
                 outpath_samples=shared.opts.outdir_samples or shared.opts.outdir_img2img_samples,
@@ -1565,26 +1595,22 @@ class Script(scripts.Script):
                     processed.images.append(img)
                     processed.infotexts.append(proc.infotexts[num + 1])
 
-    def random_number(self, sorting_order, size, count=None):
+    def random_number(self, sorting_order, size, count):
         """Generates random indices into the fetched page.
 
         Args:
             sorting_order (str): the sorting order. It can be 'Random', 'High Score' or 'Low Score'
             size (int): the amount of random numbers to generate
-            count (int, optional): the number of posts actually available on the
-                fetched page. When given, indices are drawn from this range rather
-                than the global COUNT. For Gelbooru, COUNT is the total hit count
-                (which can far exceed the posts on one page), so passing the real
-                page length here prevents out-of-range indices. Falls back to the
-                global COUNT when not supplied.
+            count (int): the number of posts actually available on the fetched
+                page. Indices are drawn from this range. Pass the real page
+                length - for Gelbooru the global hit count can far exceed the
+                posts on one page, which would otherwise yield out-of-range
+                indices.
 
         Returns:
             list: the random indices (may be fewer than `size` if the page is small)
         """
-        global COUNT
-        n = count if count is not None else COUNT
-        if n is None:
-            n = 0
+        n = count if count is not None else 0
         # Never index past what the page actually holds.
         n = min(n, POST_AMOUNT)
         if n <= 0:
@@ -1599,6 +1625,38 @@ class Script(scripts.Script):
         else:
             random_numbers = random.sample(range(n), draw)
         return list(random_numbers)
+
+    def apply_deepbooru(self, prompt, type_deepbooru):
+        """Run deepbooru over self.last_img and merge its tags into `prompt`
+        (a str or a list of str), returning the same shape. Shared by the
+        txt2img (before_process) and img2img (postprocess) paths so the two
+        can't drift apart.
+
+        If deepbooru is unavailable, the prompt is returned unchanged rather
+        than fed through modify_prompt - which in 'Replace' mode would discard
+        the booru tags we already applied.
+        """
+        if deepbooru is None:
+            print('Ranbooru: Deepbooru unavailable; keeping tags as-is.')
+            return prompt
+
+        tagged_prompts = self.use_autotagger('deepbooru')
+        if not isinstance(tagged_prompts, list):
+            tagged_prompts = [tagged_prompts]
+        if not tagged_prompts:
+            return prompt
+
+        def _tag_for(i):
+            return tagged_prompts[i] if i < len(tagged_prompts) else tagged_prompts[-1]
+
+        if isinstance(prompt, list):
+            return [
+                remove_repeated_tags(modify_prompt(pr, _tag_for(num), type_deepbooru))
+                for num, pr in enumerate(prompt)
+            ]
+        # Single prompt: pair with the first tagged result (a string), and
+        # never index into the string itself.
+        return remove_repeated_tags(modify_prompt(prompt, tagged_prompts[0], type_deepbooru))
 
     def use_autotagger(self, model):
         """Use the autotagger to tag the images

@@ -35,12 +35,14 @@ This fork diverges from [Inzaniak/sd-webui-ranbooru](https://github.com/Inzaniak
 - **Gelbooru API credentials UI** — enter and optionally save your Gelbooru API key / user ID; saved credentials are hidden in the UI and can be cleared. (Gelbooru has required an API key + user ID since June 2025.)
 
 ### Behaviour fixes
-- **Empty searches no longer crash and no longer skip LoRAnado.** A search returning no posts — a booru error page with no `post` key, an empty result, or an exhausted page walk-down — now skips only the tag-application step, leaves your prompt as written, and still runs LoRAnado and the rest of the pass. (Previously this raised and aborted.)
+- **Empty searches no longer crash and no longer skip LoRAnado — including with img2img/ControlNet on.** A search returning no posts (a booru error page with no `post` key, an empty result, or an exhausted walk-down) skips only tag application, leaves your prompt as written, and still runs LoRAnado and the rest. When img2img or ControlNet is enabled but no images were retrieved, the pass now runs as a normal generation instead of crashing later on a missing seed image or silently running at one step.
+- **Prompt list is padded to the image count.** When a page has fewer posts than `batch_size × n_iter`, the fetched prompts are cycled to fill, so `p.prompt` stays the same length as the seed/negative-prompt lists instead of leaving the run with mismatched lengths.
+- **Image downloads are error-handled.** A 404, an HTML interstitial, or a truncated image is caught and skipped rather than raising deep in processing.
 - **Index range taken from the fetched page, not the global hit count.** For Gelbooru, the total hit count can far exceed the posts on one page; indices are now drawn from the actual page length, fixing an `IndexError` on small/late pages and the `ValueError`/`NaN` crashes on empty pages.
 - **All boorus build request URLs without mutating state.** The base class now builds each request URL from a pristine base and passes credentials via `params=`. This fixes **mix-from-presets on every booru** (previously the two fetches it performs corrupted the URL on the eight non-Gelbooru classes), and removes the duplicated-query-parameter problem generally.
 - **Request timeouts everywhere.** Every booru request now has a timeout, so a stalled booru can't hang generation indefinitely.
 - **Gelbooru credentials kept out of logs and cache.** `api_key`/`user_id` now travel as request params rather than in the URL string, the credential-bearing URL print was removed, and the request cache ignores those parameters so they aren't written into `ranbooru_cache.sqlite`.
-- **Page walk-down re-rolls within the known-good range** instead of linearly decrementing from a possibly-distant page, so an empty page past a booru's result window recovers in a few tries rather than exhausting retries.
+- **Page walk-down narrows geometrically.** On an empty Gelbooru page it halves the upper page bound each retry, converging on the booru's real serveable range in about `log₂(pages)` steps, with a guaranteed page-0 fallback — rather than re-rolling uniformly across all hit-count-implied pages (which, for a large search, mostly land past the result window).
 - **Mix prompts** takes an equal share from each source post, copies the post dict before mutating tags (fixing a cache-poisoning bug), and filters empty/whitespace tags.
 
 ### Smaller fixes
@@ -51,9 +53,12 @@ This fork diverges from [Inzaniak/sd-webui-ranbooru](https://github.com/Inzaniak
 - **Caching no longer affects other extensions.** The extension used `requests_cache.install_cache()`, which monkeypatches `requests` globally for the entire WebUI process; it now uses a dedicated `CachedSession` for booru requests only. Credentials remain excluded from the cache.
 - Preset selection no longer collapses duplicate preset text to the first entry's Max Pages override.
 - **Use Same Seed** now produces one seed per image across the whole run (`batch_size × n_iter`), not just one batch's worth.
-- **Gradio 4.x compatibility:** the two remaining `gr.Radio.update` / `gr.Checkbox.update` calls (removed in Gradio 4.x, which Forge Neo uses) are converted to `gr.update`.
+- **Gradio 4.x compatibility.** The `.update()` component class-methods and the `gr.Box` layout were both removed in Gradio 4.0. This fork converts the remaining `gr.Radio.update` / `gr.Checkbox.update` calls to `gr.update`, and replaces every `gr.Box` with `gr.Group` (valid across Gradio 4.x and 5.x). Empty-string dropdown defaults are now `None` to avoid 4.x value-not-in-choices warnings.
 - The Gelbooru credentials panel and the Fringe Benefits checkbox now start hidden when the default booru isn't Gelbooru, instead of flashing visible until the booru dropdown is changed.
-- Assorted upstream cleanups (e621 class/name and `get_post` return, duplicated `COUNT` line in Yandere).
+- **Tag-file loading is guarded.** The search/remove `.txt` options check that a file is actually selected and exists (opening with a context manager and explicit encoding), instead of raising `IsADirectoryError`/`TypeError` when enabled with nothing chosen.
+- **Descriptive user agent** (`sd-webui-ranbooru-D/…`) so boorus like e621 that block generic agents are satisfied.
+- `requests-cache` is pinned to `>=1.0` in `install.py`, the range where `ignored_parameters` both drops credentials from the cache key and redacts them from the stored request — which is what keeps them out of `ranbooru_cache.sqlite`.
+- Assorted cleanups: `random_number` takes an explicit page count (no stale global), `use_same_seed` sizing, e621 class name / `get_post` return, duplicated `COUNT` line in Yandere.
 
 > **Note on the companion State extension:** if you use `sd-webui-state` to persist panel settings, clear the `state-ext-ranbooru-*` keys from `localStorage` (or re-set the controls once) after updating. These additions inserted new controls into the middle of the panel's control list, which shifts the positional indices State uses; appending them at the end would have avoided the break, and a future version may re-order them to restore compatibility.
 
