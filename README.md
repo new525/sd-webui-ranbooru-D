@@ -34,12 +34,20 @@ This fork diverges from [Inzaniak/sd-webui-ranbooru](https://github.com/Inzaniak
 - **Max Pages ceiling raised** to 1000 (was 100), matching what the preset Max Pages fields already allowed.
 - **Gelbooru API credentials UI** — enter and optionally save your Gelbooru API key / user ID; saved credentials are hidden in the UI and can be cleared. (Gelbooru has required an API key + user ID since June 2025.)
 
-### Behaviour fixes
-- **Failed searches no longer skip LoRAnado.** When a tag search returns no posts, the extension now skips only the tag-application step and still runs LoRAnado (and leaves your original prompt intact), instead of aborting the whole pass.
-- **Automatic page walk-down.** When a fetched page comes back empty (common when Max Pages exceeds a booru's real page count, or past Gelbooru's result window), the extension steps down one page at a time and retries instead of immediately erroring out.
-- **Mix prompts rewritten** to take an equal share from each source post, to not mutate the cached post data, and to filter out empty/whitespace tags.
+### Behaviour changes
+- **Mix prompts rewritten** to take an equal share from each source post, to copy the post dict before mutating its tags (fixing a real cache-poisoning bug where mixed tags leaked into the cached page), and to filter out empty/whitespace tags.
+- **Page walk-down (partial).** When a Gelbooru fetch lands on an empty page, `get_data` steps the page index down and retries up to 15 times before giving up. This reduces — but does not eliminate — empty-result errors; a random page far past a booru's real result window can still exhaust the retries and surface the upstream "no posts found" error. See [Known limitations](#known-limitations-in-this-fork).
 
-> **Note on the companion State extension:** if you use `sd-webui-state` to persist panel settings, note that these additions change the control layout. State tracks Ranbooru positionally, so clear the `state-ext-ranbooru-*` keys from `localStorage` (or re-set the controls once) after updating.
+### Known limitations in this fork
+These are real issues identified in review and **not yet fixed** at this commit. They are documented here rather than hidden:
+- **Empty results can still raise.** The fork does not wrap the fetch/select block, so a search that returns no posts (a Gelbooru API error page, an empty booru result, or a walk-down that exhausts its retries) raises an exception instead of falling through — which means LoRAnado does not run on those passes. An earlier development build had a graceful fallthrough; it is not present in this commit.
+- **Mix-from-presets corrupts URLs on non-Gelbooru boorus.** Only the Gelbooru class rebuilds its request URL per call; the other booru classes still append to a stored URL in place, so the two fetches mix-from-presets performs on a non-Gelbooru instance can produce a malformed query. Use mix-from-presets with Gelbooru only for now.
+- **No request timeouts.** A stalled booru request can hang generation indefinitely.
+- **Gelbooru credentials appear in the console log.** The fetched URL (including `api_key`/`user_id` for Gelbooru) is printed to the WebUI console and is used as the request-cache key. The saved `credentials.json` itself is gitignored, but treat your console output and `ranbooru_cache.sqlite` as sensitive until this is fixed.
+
+A follow-up commit is planned to address these.
+
+> **Note on the companion State extension:** if you use `sd-webui-state` to persist panel settings, clear the `state-ext-ranbooru-*` keys from `localStorage` (or re-set the controls once) after updating. These additions inserted new controls into the middle of the panel's control list, which shifts the positional indices State uses; appending them at the end would have avoided the break, and a future version may re-order them to restore compatibility.
 
 ---
 
@@ -114,4 +122,4 @@ Also check Inzaniak's other scripts:
 - [Workflow](https://github.com/Inzaniak/sd-webui-workflow)
 
 ## License
-This fork inherits the license of the upstream repository. Refer to [Inzaniak/sd-webui-ranbooru](https://github.com/Inzaniak/sd-webui-ranbooru) for licensing terms; this fork claims no additional rights over the original work.
+**Upstream has no LICENSE file.** Without a license, default copyright applies to the original work and no redistribution rights are granted — so, strictly, neither upstream nor this fork is clearly licensed for reuse. This fork claims no rights over Inzaniak's original work and exists only as a compatibility/feature fork. If you intend to rely on or redistribute this, consider asking [Inzaniak](https://github.com/Inzaniak) to add an explicit license upstream. (Not legal advice.)
