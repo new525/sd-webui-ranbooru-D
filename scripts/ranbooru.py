@@ -102,10 +102,10 @@ COLORED_BG = ['black_background', 'aqua_background', 'white_background', 'colore
 ADD_BG = ['outdoors', 'indoors']
 BW_BG = ['monochrome', 'greyscale', 'grayscale']
 POST_AMOUNT = 100
-COUNT = 100 #Number of images the search returned. Booru classes below were modified to update this value with the latest search result count.
 DEBUG = False
 REQUEST_TIMEOUT = 20  # seconds; prevents a stalled booru from hanging generation
 DEFAULT_BOORU = 'safebooru'  # single source of truth for the default booru
+VERSION = '1.3'  # single source of truth: used by the Script class and the user agent
 
 # Booru requests go through a dedicated CachedSession rather than
 # requests_cache.install_cache(), which would monkeypatch `requests` globally
@@ -205,8 +205,9 @@ class Booru():
         self._base_url = booru_url
         self.booru_url = booru_url  # last-built URL, for logging only
         # Descriptive user agent. e621 (and others) may block generic agents
-        # per their API terms; identify the fork and point to the repo.
-        self.headers = {'user-agent': 'sd-webui-ranbooru-D/1.3 (+github.com/new525/sd-webui-ranbooru-D)'}
+        # per their API terms; identify the fork and point to the repo. Built
+        # from the module VERSION so it can't drift from the Script version.
+        self.headers = {'user-agent': f'sd-webui-ranbooru-D/{VERSION} (+github.com/new525/sd-webui-ranbooru-D)'}
 
     def _request_url(self, extra=''):
         """Build a request URL from the pristine base without mutating state."""
@@ -242,7 +243,6 @@ class Gelbooru(Booru):
         return {}
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         if id:
             add_tags = ''
 
@@ -291,7 +291,9 @@ class Gelbooru(Booru):
             # COUNT-implied pages would keep landing past that ceiling. Instead,
             # halve the upper bound on each empty hit so the search range
             # converges on the real serveable ceiling in ~log2(pages) tries.
-            upper = max(1, COUNT // POST_AMOUNT + 1)
+            # Never exceed the user's Max Pages: the slider is a hard ceiling on
+            # how deep we page, so an empty hit must re-roll inside it, not past it.
+            upper = max(1, min(max_pages, COUNT // POST_AMOUNT + 1))
             retries = 0
             while not (isinstance(data, dict) and data.get('post')) and retries < 12 and upper > 1:
                 retries += 1
@@ -357,7 +359,6 @@ class XBooru(Booru):
         super().__init__('xbooru', f'https://xbooru.com/index.php?page=dapi&s=post&q=index&json=1&limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
             if id:
@@ -392,7 +393,6 @@ class Rule34(Booru):
         super().__init__('rule34', f'https://api.rule34.xxx/index.php?page=dapi&s=post&q=index&json=1&limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
             if id:
@@ -424,7 +424,6 @@ class Safebooru(Booru):
         super().__init__('safebooru', f'https://safebooru.org/index.php?page=dapi&s=post&q=index&json=1&limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
             if id:
@@ -459,7 +458,6 @@ class Konachan(Booru):
         super().__init__('konachan', f'https://konachan.com/post.json?limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
             if id:
@@ -491,7 +489,6 @@ class Yandere(Booru):
         super().__init__('yande.re', f'https://yande.re/post.json?limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
             if id:
@@ -523,7 +520,6 @@ class AIBooru(Booru):
         super().__init__('AIBooru', f'https://aibooru.online/posts.json?limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
             if id:
@@ -557,7 +553,6 @@ class Danbooru(Booru):
         super().__init__('danbooru', f'https://danbooru.donmai.us/posts.json?limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
             if id:
@@ -597,7 +592,6 @@ class e621(Booru):
         super().__init__('e621', f'https://e621.net/posts.json?limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
             if id:
@@ -761,7 +755,7 @@ class Script(scripts.Script):
     previous_loras = ''
     last_img = []
     real_steps = 0
-    version = "1.3"
+    version = VERSION
     original_prompt = ''
 
     def get_files(self, path):
@@ -1212,9 +1206,10 @@ class Script(scripts.Script):
             print(f'Using {booru}')
 
             # Secondary pool for preset-mix: image 2 onward drawn from a random
-            # Tag Preset's search. Fetched BEFORE the primary pool on purpose:
-            # get_data sets the global COUNT used by random_number for indexing,
-            # and the primary pool's fetch must be the one that sets it last.
+            # Tag Preset's search, fetched into its own variable below. (Indexing
+            # is now per-page-local via random_number(count=page_len), so this no
+            # longer has to run before the primary fetch - each pool is indexed
+            # against its own length.)
             preset_mix_data = None
             if mix_prompt and mix_from_presets and use_random_preset:
                 preset_pool = [(tp, pp) for tp, pp in zip(
@@ -1567,6 +1562,16 @@ class Script(scripts.Script):
             final_prompts = p.prompt
             if use_deepbooru:
                 final_prompts = self.apply_deepbooru(p.prompt, type_deepbooru)
+            # init_images must be sized to what img2img's init() accepts. A1111
+            # tiles the init-image list across n_iter itself and raises a "bad
+            # number of images" RuntimeError if the list is neither length 1 nor
+            # exactly batch_size. self.last_img was padded to batch_size * n_iter
+            # upstream (the deepbooru autotagger and the image-append loop below
+            # both rely on that full-length list), so pass a batch_size-length
+            # slice here instead of the padded whole. A length-1 list stays
+            # length 1. This is the shape every WebUI fork accepts, whether or
+            # not Forge Neo kept A1111's exact check.
+            init_images = self.last_img[:p.batch_size] if len(self.last_img) > p.batch_size else self.last_img
             p = StableDiffusionProcessingImg2Img(
                 sd_model=shared.sd_model,
                 outpath_samples=shared.opts.outdir_samples or shared.opts.outdir_img2img_samples,
@@ -1582,7 +1587,7 @@ class Script(scripts.Script):
                 cfg_scale=p.cfg_scale,
                 width=width,
                 height=height,
-                init_images=self.last_img,
+                init_images=init_images,
                 denoising_strength=denoising,
             )
             proc = process_images(p)
@@ -1591,9 +1596,19 @@ class Script(scripts.Script):
             if use_last_img:
                 processed.images.append(self.last_img[0])
             else:
+                # Append each source image with a matching infotext. The num + 1
+                # offset assumes proc.infotexts[0] is the grid entry, which only
+                # exists when the grid is enabled; without it the last iteration
+                # would index past the end. Guard the index and fall back to the
+                # per-image infotext (or the last available one) instead of
+                # raising IndexError.
                 for num, img in enumerate(self.last_img):
                     processed.images.append(img)
-                    processed.infotexts.append(proc.infotexts[num + 1])
+                    if proc.infotexts:
+                        idx = num + 1
+                        if idx >= len(proc.infotexts):
+                            idx = min(num, len(proc.infotexts) - 1)
+                        processed.infotexts.append(proc.infotexts[idx])
 
     def random_number(self, sorting_order, size, count):
         """Generates random indices into the fetched page.
