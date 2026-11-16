@@ -264,10 +264,14 @@ class Booru():
         pass
 
 
-# Gelbooru refuses pages past a paging limit with a plain-text "Too deep!"
-# reply (HTTP 200). The lowest page it has refused this session is kept here,
-# so later generations pick pages below it instead of rediscovering the limit
-# with wasted requests. It is learned, not hardcoded: the limit isn't documented.
+# Gelbooru serves only the first 20,000 posts of a search; a page past that
+# gets a plain-text "Too deep! Pull it back some." reply (HTTP 200) instead of
+# JSON. Source: Grabber's maintainer ("Gelbooru blocks requests after the
+# 20,000 first images", Bionus/imgbrd-grabber#1233) and gallery-dl#2232. At
+# POST_AMOUNT posts per page that's the first 200 pages, so Max Pages is
+# capped there for Gelbooru. In case the limit changes, a refused page is
+# still re-rolled lower, and the lowest refused page is kept for the session.
+GELBOORU_MAX_POSTS_DEEP = 20000
 _GELBOORU_PAGING = {'too_deep': None}
 _TOO_DEEP = object()  # fetch() result for a "Too deep!" reply
 
@@ -360,20 +364,25 @@ class Gelbooru(Booru):
                 if pid == 0:
                     break
                 new_pid = random.randint(0, pid - 1)
-                print(f"Ranbooru: page {pid} is past Gelbooru's paging limit, trying page {new_pid}. "
-                      f"A Max Pages of {pid} or less avoids the extra request.")
+                print(f"Ranbooru: Gelbooru refused page {pid} as too deep (Max Pages for this search: "
+                      f"{max_pages}), trying page {new_pid}.")
                 pid = new_pid
             print("Ranbooru: Gelbooru kept answering \"Too deep!\"; giving up on this search.")
             return None
 
+        deepest = max(1, GELBOORU_MAX_POSTS_DEEP // POST_AMOUNT)
+
         def page_limit(pages):
-            """The user's page range, capped below any page Gelbooru has refused."""
+            """The page range to pick from: the user's, capped at Gelbooru's
+            paging limit and below any page it has refused this session."""
             known = _GELBOORU_PAGING['too_deep']
-            return max(1, min(pages, known)) if known is not None else max(1, pages)
+            return max(1, min(pages, deepest, known if known is not None else pages))
 
         if page_limit(max_pages) < max_pages:
-            print(f"Ranbooru: picking from the first {page_limit(max_pages)} pages: Gelbooru refused "
-                  f"page {_GELBOORU_PAGING['too_deep']} as too deep earlier this session.")
+            known = _GELBOORU_PAGING['too_deep']
+            why = (f"Gelbooru refused page {known} as too deep earlier this session" if known is not None and known < deepest
+                   else f"Gelbooru serves only the first {GELBOORU_MAX_POSTS_DEEP:,} posts of a search")
+            print(f"Ranbooru: Max Pages is {max_pages}, but picking from the first {page_limit(max_pages)} pages: {why}.")
         # randint is randrange(a, b+1), so pass the page count - 1
         pid = random.randint(0, page_limit(max_pages) - 1)
         data = fetch_page(pid)
