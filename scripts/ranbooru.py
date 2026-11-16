@@ -10,6 +10,7 @@ import numpy as np
 import importlib
 import requests_cache
 import json
+import urllib.parse
 
 from modules.processing import process_images, StableDiffusionProcessingImg2Img
 from modules import shared
@@ -105,7 +106,7 @@ POST_AMOUNT = 100
 DEBUG = False
 REQUEST_TIMEOUT = 20  # seconds; prevents a stalled booru from hanging generation
 DEFAULT_BOORU = 'safebooru'  # single source of truth for the default booru
-VERSION = '1.4'  # single source of truth: used by the Script class and the user agent
+VERSION = '1.4.1'  # single source of truth: used by the Script class and the user agent
 
 # Booru requests go through a dedicated CachedSession rather than
 # requests_cache.install_cache(), which would monkeypatch `requests` globally
@@ -263,13 +264,53 @@ class Booru():
         pass
 
 
+def clean_gelbooru_credentials(api_key, user_id):
+    """Accept the API key and user ID however they were pasted.
+
+    Before 1.2 they were glued into the URL as raw text, which happened to
+    tolerate a value holding a whole query fragment ("&api_key=...&user_id=...")
+    or a stray space or line break. Since 1.2 they go through params=, which
+    URL-encodes them, so such a value reaches Gelbooru mangled and is refused
+    with a 401. Pull the real values out of a pasted fragment, and strip
+    whitespace, so both forms keep working."""
+    api_key = str(api_key or '').strip()
+    user_id = str(user_id or '').strip()
+    found = {}
+    for field in (api_key, user_id):
+        if '=' in field:
+            for k, v in urllib.parse.parse_qsl(field.lstrip('?&'), keep_blank_values=True):
+                if k.strip() in ('api_key', 'user_id') and v.strip():
+                    found[k.strip()] = v.strip()
+    if found:
+        api_key = found.get('api_key', '' if '=' in api_key else api_key)
+        user_id = found.get('user_id', '' if '=' in user_id else user_id)
+    return api_key, user_id
+
+
 class Gelbooru(Booru):
 
-    def __init__(self, fringe_benefits, api_key=None, user_id=None):
+    def __init__(self, fringe_benefits, api_key=None, user_id=None, credentials_source=''):
         super().__init__('gelbooru', f'https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1&limit={POST_AMOUNT}')
         self.fringeBenefits = fringe_benefits
-        self.api_key = api_key
-        self.user_id = user_id
+        self.api_key, self.user_id = clean_gelbooru_credentials(api_key, user_id)
+        self.credentials_source = credentials_source
+        self._reported = False
+
+    def report_credentials(self):
+        """One console line saying what will be sent, without the key itself, so
+        a 401 can be told apart: nothing sent, or sent and refused."""
+        if self._reported:
+            return
+        self._reported = True
+        src = self.credentials_source
+        if self.api_key and self.user_id:
+            print(f"Ranbooru: sending Gelbooru credentials{' from ' + src if src else ''}: user ID {self.user_id}, "
+                  f"API key of {len(self.api_key)} characters.")
+        else:
+            missing = ' and '.join(n for n, v in (('API key', self.api_key), ('user ID', self.user_id)) if not v)
+            print(f"Ranbooru: no Gelbooru {missing} found{' in ' + src if src else ''}, so no credentials are sent and Gelbooru "
+                  f"will refuse the request. Enter them in the Ranbooru panel, or check "
+                  f"{credentials_manager.credentials_file}.")
 
     def _credentials(self):
         """Credentials as a params dict, so they are never baked into the
@@ -285,6 +326,7 @@ class Gelbooru(Booru):
         base_url = self._base_url
         cookies = {'fringeBenefits': 'yup'} if self.fringeBenefits else None
         creds = self._credentials()
+        self.report_credentials()
 
         def fetch(pid):
             # Build the URL fresh each attempt - never mutate the base. The
@@ -1167,12 +1209,14 @@ class Script(scripts.Script):
             # Handle Gelbooru credentials
             gelbooru_api_key = None
             gelbooru_user_id = None
+            gelbooru_credentials_source = ''
             
             if booru == 'gelbooru':
                 # Use provided credentials or load from saved credentials
                 if api_key.strip() and user_id.strip():
                     gelbooru_api_key = api_key.strip()
                     gelbooru_user_id = user_id.strip()
+                    gelbooru_credentials_source = 'the Ranbooru panel'
                     
                     # Save credentials if checkbox is checked
                     if save_credentials:
@@ -1182,10 +1226,11 @@ class Script(scripts.Script):
                     saved_credentials = credentials_manager.get_booru_credentials('gelbooru')
                     gelbooru_api_key = saved_credentials.get('api_key', '')
                     gelbooru_user_id = saved_credentials.get('user_id', '')
+                    gelbooru_credentials_source = credentials_manager.credentials_file
             
             # Initialize APIs
             booru_apis = {
-                'gelbooru': Gelbooru(fringe_benefits, gelbooru_api_key, gelbooru_user_id),
+                'gelbooru': Gelbooru(fringe_benefits, gelbooru_api_key, gelbooru_user_id, gelbooru_credentials_source),
                 'rule34': Rule34(),
                 'safebooru': Safebooru(),
                 'danbooru': Danbooru(),
