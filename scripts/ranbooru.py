@@ -106,7 +106,7 @@ POST_AMOUNT = 100
 DEBUG = False
 REQUEST_TIMEOUT = 20  # seconds; prevents a stalled booru from hanging generation
 DEFAULT_BOORU = 'safebooru'  # single source of truth for the default booru
-VERSION = '1.4.1'  # single source of truth: used by the Script class and the user agent
+VERSION = '1.4.2'  # single source of truth: used by the Script class and the user agent
 
 # Booru requests go through a dedicated CachedSession rather than
 # requests_cache.install_cache(), which would monkeypatch `requests` globally
@@ -137,10 +137,10 @@ def enable_booru_cache(enabled):
             _BOORU_SESSION = None
 
 
-def _booru_requester():
+def _booru_requester(cached=True):
     """Return the cached session if caching is on, else the plain requests module.
     Both expose a compatible .get(), so call sites don't change shape."""
-    return _BOORU_SESSION if _BOORU_SESSION is not None else requests
+    return _BOORU_SESSION if cached and _BOORU_SESSION is not None else requests
 RATING_TYPES = {
     "none": {
         "All": "All"
@@ -264,6 +264,23 @@ class Booru():
         pass
 
 
+# Gelbooru's API pages only so deep into a search; a page past that gets a
+# plain-text "Too deep! Pull it back some." reply (HTTP 200) instead of JSON.
+# Older reports put the limit at 20,000 posts (Bionus/imgbrd-grabber#1233,
+# gallery-dl#2232); in November 2026 it measured about 1,000 posts (pid 10
+# served and pid 11 refused at limit=100; pid 50/51 at limit=20).
+# So Ranbooru doesn't page Gelbooru for randomness at all: it asks for page 0
+# with sort:random, which Gelbooru answers with a random draw from the whole
+# search (checked the same day: three requests, 300 different posts spread
+# across all post IDs). Paging is only used when the user's tags carry their
+# own sort: order. Then Max Pages is capped at the older 20,000-post figure,
+# and a refused page is re-rolled lower, with the lowest refused page kept for
+# the session, so a lower limit is learned instead of hardcoded.
+GELBOORU_MAX_POSTS_DEEP = 20000
+_GELBOORU_PAGING = {'too_deep': None}
+_TOO_DEEP = object()  # fetch() result for a "Too deep!" reply
+
+
 def clean_gelbooru_credentials(api_key, user_id):
     """Accept the API key and user ID however they were pasted.
 
@@ -328,19 +345,70 @@ class Gelbooru(Booru):
         creds = self._credentials()
         self.report_credentials()
 
-        def fetch(pid):
+        def fetch(pid, extra='', cached=True):
             # Build the URL fresh each attempt - never mutate the base. The
             # api_key/user_id go through params=, so they do NOT appear in the
             # URL we store for logging.
-            url = f"{base_url}&pid={pid}{id}{add_tags}"
+            url = f"{base_url}&pid={pid}{id}{add_tags}{extra}"
             self.booru_url = url  # recorded for the (credential-free) debug print
-            res = _booru_requester().get(url, params=creds, cookies=cookies,
-                                         headers=self.headers, timeout=REQUEST_TIMEOUT)
+            # A sort:random request has the same URL every time, so a cached
+            # answer would repeat the same "random" posts for an hour: skip the cache.
+            res = _booru_requester(cached).get(url, params=creds, cookies=cookies,
+                                               headers=self.headers, timeout=REQUEST_TIMEOUT)
+            if res.status_code == 200 and (res.text or '').lstrip().lower().startswith('too deep'):
+                return _TOO_DEEP
             return self._json(res, dict)  # None for a bad reply
 
-        # randint is randrange(a, b+1), so pass max_pages-1
-        pid = random.randint(0, max(0, max_pages - 1))
-        data = fetch(pid)
+        def fetch_page(pid):
+            """fetch(pid), but a page past Gelbooru's paging limit is not a dead end:
+            remember it and re-roll below the deepest page refused so far."""
+            for _ in range(12):
+                data = fetch(pid)
+                if data is not _TOO_DEEP:
+                    return data
+                known = _GELBOORU_PAGING['too_deep']
+                _GELBOORU_PAGING['too_deep'] = pid if known is None else min(known, pid)
+                if pid == 0:
+                    break
+                new_pid = random.randint(0, pid - 1)
+                print(f"Ranbooru: Gelbooru refused page {pid} as too deep (Max Pages for this search: "
+                      f"{max_pages}), trying page {new_pid}.")
+                pid = new_pid
+            print("Ranbooru: Gelbooru kept answering \"Too deep!\"; giving up on this search.")
+            return None
+
+        # A post ID is a single post on page 0: ask for exactly that, never a random
+        # page (which under Gelbooru's paging limit can come back "Too deep!").
+        if id:
+            data = fetch(0)
+            return data if isinstance(data, dict) else {}
+
+        # Random draw from the whole search in one request (see GELBOORU_MAX_POSTS_DEEP).
+        # Not when the user's tags set their own sort: order.
+        if add_tags and 'sort:' not in add_tags.lower():
+            data = fetch(0, extra='+sort:random', cached=False)
+            if not isinstance(data, dict):
+                return {}
+            total = data.get('@attributes', {}).get('count', 0)
+            print(f" Processing {len(data.get('post') or [])} random posts out of {total} results.")
+            return data
+
+        deepest = max(1, GELBOORU_MAX_POSTS_DEEP // POST_AMOUNT)
+
+        def page_limit(pages):
+            """The page range to pick from: the user's, capped at Gelbooru's
+            paging limit and below any page it has refused this session."""
+            known = _GELBOORU_PAGING['too_deep']
+            return max(1, min(pages, deepest, known if known is not None else pages))
+
+        if page_limit(max_pages) < max_pages:
+            known = _GELBOORU_PAGING['too_deep']
+            why = (f"Gelbooru refused page {known} as too deep earlier this session" if known is not None and known < deepest
+                   else f"Gelbooru serves only the first {GELBOORU_MAX_POSTS_DEEP:,} posts of a search")
+            print(f"Ranbooru: Max Pages is {max_pages}, but picking from the first {page_limit(max_pages)} pages: {why}.")
+        # randint is randrange(a, b+1), so pass the page count - 1
+        pid = random.randint(0, page_limit(max_pages) - 1)
+        data = fetch_page(pid)
         if data is None:
             # A refusal, a rate limit or an error page: more requests won't help.
             return {}
@@ -350,9 +418,11 @@ class Gelbooru(Booru):
         if COUNT <= max_pages * POST_AMOUNT:
             actual_pages = max(1, COUNT // POST_AMOUNT + 1)
             print(f" Processing {COUNT} results.")
-            if actual_pages != max_pages:
-                pid = random.randint(0, actual_pages - 1)
-                data = fetch(pid)
+            # Re-roll only when the first page fell past the last page of results;
+            # a page inside the range is as random a pick as a re-roll would be.
+            if pid >= actual_pages:
+                pid = random.randint(0, page_limit(actual_pages) - 1)
+                data = fetch_page(pid)
                 if data is None:
                     return {}
         else:
@@ -372,20 +442,20 @@ class Gelbooru(Booru):
             # converges on the real serveable ceiling in ~log2(pages) tries.
             # Never exceed the user's Max Pages: the slider is a hard ceiling on
             # how deep we page, so an empty hit must re-roll inside it, not past it.
-            upper = max(1, min(max_pages, COUNT // POST_AMOUNT + 1))
+            upper = page_limit(min(max_pages, COUNT // POST_AMOUNT + 1))
             retries = 0
             while not (isinstance(data, dict) and data.get('post')) and retries < 12 and upper > 1:
                 retries += 1
                 pid = random.randint(0, upper - 1)
                 print(f"Ranbooru: empty page, searching within first {upper} page(s) (try {retries})")
-                data = fetch(pid)
+                data = fetch_page(pid)
                 if data is None:
                     return {}
                 if not data.get('post'):
                     upper = max(1, upper // 2)
             # Final attempt at page 0, which almost always has results.
             if not (isinstance(data, dict) and data.get('post')):
-                data = fetch(0)
+                data = fetch_page(0)
         return data if isinstance(data, dict) else {}
 
     def get_post(self, add_tags, max_pages=10, id=''):
@@ -964,7 +1034,8 @@ class Script(scripts.Script):
         with InputAccordion(False, label="Ranbooru", elem_id=self.elem_id("ra_enable")) as enabled:
             booru = gr.Dropdown(
                 ["safebooru", "rule34", "danbooru", "gelbooru", "konachan", 'yande.re', 'aibooru', 'xbooru', 'e621'], label="Booru", value=DEFAULT_BOORU)
-            max_pages = gr.Slider(label="Max Pages", minimum=1, maximum=1000, value=100, step=1)
+            max_pages = gr.Slider(label="Max Pages", minimum=1, maximum=1000, value=100, step=1,
+                                  info="Gelbooru ignores this and draws from the whole search, unless your tags include a sort: order.")
             gr.Markdown("""## Post""")
             post_id = gr.Textbox(lines=1, label="Post ID")
             gr.Markdown("""## Tags""")
