@@ -307,6 +307,7 @@ class Gelbooru(Booru):
         self.api_key, self.user_id = clean_gelbooru_credentials(api_key, user_id)
         self.credentials_source = credentials_source
         self._reported = False
+        self._reported_deep = False
 
     def report_credentials(self):
         """One console line saying what will be sent, without the key itself, so
@@ -361,6 +362,12 @@ class Gelbooru(Booru):
                     return data
                 known = _GELBOORU_PAGING['too_deep']
                 _GELBOORU_PAGING['too_deep'] = pid if known is None else min(known, pid)
+                if pid < deepest and not self._reported_deep:
+                    # Inside the documented limit, so this is unexpected: show the exact
+                    # request (self.booru_url never holds the credentials).
+                    self._reported_deep = True
+                    print(f"Ranbooru: unexpected \"Too deep!\" for page {pid}, within Gelbooru's documented "
+                          f"{deepest} pages. Request (credentials removed): {self.booru_url}")
                 if pid == 0:
                     break
                 new_pid = random.randint(0, pid - 1)
