@@ -105,7 +105,7 @@ POST_AMOUNT = 100
 DEBUG = False
 REQUEST_TIMEOUT = 20  # seconds; prevents a stalled booru from hanging generation
 DEFAULT_BOORU = 'safebooru'  # single source of truth for the default booru
-VERSION = '1.3'  # single source of truth: used by the Script class and the user agent
+VERSION = '1.4'  # single source of truth: used by the Script class and the user agent
 
 # Booru requests go through a dedicated CachedSession rather than
 # requests_cache.install_cache(), which would monkeypatch `requests` globally
@@ -195,6 +195,14 @@ def check_exception(booru, parameters):
         raise Exception("Danbooru does not support multiple tags. You can have only one tag.")
 
 
+# Extra advice for statuses that mean the booru refused the request outright.
+REFUSAL_HINTS = {
+    401: ' The booru refused the request: check its API credentials (for Gelbooru, the API key and user ID fields).',
+    403: ' The booru refused the request: check its API credentials (for Gelbooru, the API key and user ID fields).',
+    429: ' The booru is rate-limiting requests: wait a little, or generate fewer images at once.',
+}
+
+
 class Booru():
 
     def __init__(self, booru, booru_url):
@@ -219,6 +227,34 @@ class Booru():
         """Single choke point for GETs: always sets headers and a timeout, and
         routes through the booru cache session when caching is enabled."""
         return _booru_requester().get(url, headers=self.headers, timeout=REQUEST_TIMEOUT)
+
+    def _json(self, res, expect):
+        """Decode a booru reply. Returns the JSON when it has the expected shape
+        (list or dict). Otherwise - an empty body, an HTML error page, or a JSON
+        error object where posts were expected - prints why, with the HTTP status,
+        and returns None, so the caller reports "no posts" instead of raising and
+        aborting the generation."""
+        status = getattr(res, 'status_code', '?')
+        hint = REFUSAL_HINTS.get(status, '')
+        try:
+            data = res.json()
+        except ValueError:
+            body = (res.text or '').strip()
+            what = 'an empty response' if not body else f'a non-JSON response ({body[:80]!r})'
+            print(f"Ranbooru: {self.booru} returned {what} (status {status}).{hint}")
+            return None
+        # An HTTP error is never a page of posts, even when its body is JSON
+        # of the expected shape (e.g. {"success": false, "message": ...}).
+        failed = isinstance(status, int) and status >= 400
+        if failed or not isinstance(data, expect):
+            detail = ''
+            if isinstance(data, dict):
+                detail = str(data.get('message') or data.get('reason') or data.get('error') or '')[:120].rstrip('.')
+            what = 'an error' if failed else 'an unexpected reply'
+            print(f"Ranbooru: {self.booru} returned {what} (status {status})"
+                  f"{': ' + detail if detail else ''}.{hint}")
+            return None
+        return data
 
     def get_data(self, add_tags, max_pages=10, id=''):
         pass
@@ -258,15 +294,14 @@ class Gelbooru(Booru):
             self.booru_url = url  # recorded for the (credential-free) debug print
             res = _booru_requester().get(url, params=creds, cookies=cookies,
                                          headers=self.headers, timeout=REQUEST_TIMEOUT)
-            try:
-                return res.json()
-            except ValueError:
-                print(f"Ranbooru: Gelbooru returned a non-JSON response (status {res.status_code}).")
-                return {}
+            return self._json(res, dict)  # None for a bad reply
 
         # randint is randrange(a, b+1), so pass max_pages-1
         pid = random.randint(0, max(0, max_pages - 1))
         data = fetch(pid)
+        if data is None:
+            # A refusal, a rate limit or an error page: more requests won't help.
+            return {}
         COUNT = data.get('@attributes', {}).get('count', 0) if isinstance(data, dict) else 0
 
         # If fewer results exist than the requested page range, re-roll within the actual range
@@ -276,6 +311,8 @@ class Gelbooru(Booru):
             if actual_pages != max_pages:
                 pid = random.randint(0, actual_pages - 1)
                 data = fetch(pid)
+                if data is None:
+                    return {}
         else:
             print(f" Processing {max_pages * POST_AMOUNT} out of {COUNT} results.")
 
@@ -300,7 +337,9 @@ class Gelbooru(Booru):
                 pid = random.randint(0, upper - 1)
                 print(f"Ranbooru: empty page, searching within first {upper} page(s) (try {retries})")
                 data = fetch(pid)
-                if not (isinstance(data, dict) and data.get('post')):
+                if data is None:
+                    return {}
+                if not data.get('post'):
                     upper = max(1, upper // 2)
             # Final attempt at page 0, which almost always has results.
             if not (isinstance(data, dict) and data.get('post')):
@@ -365,7 +404,9 @@ class XBooru(Booru):
                 add_tags = ''
             url = self._request_url(f"&pid={random.randint(0, max_pages-1)}{id}{add_tags}")
             res = self._get(url)
-            data = res.json()
+            data = self._json(res, list)
+            if data is None:
+                return {'post': []}
             COUNT = 0
             for post in data:
                 post['file_url'] = f"https://xbooru.com/images/{post['directory']}/{post['image']}"
@@ -399,7 +440,9 @@ class Rule34(Booru):
                 add_tags = ''
             url = self._request_url(f"&pid={random.randint(0, max_pages-1)}{id}{add_tags}")
             res = self._get(url)
-            data = res.json()
+            data = self._json(res, list)
+            if data is None:
+                return {'post': []}
             COUNT = len(data)
             if COUNT == 0:
                 max_pages = 2
@@ -430,7 +473,9 @@ class Safebooru(Booru):
                 add_tags = ''
             url = self._request_url(f"&pid={random.randint(0, max_pages-1)}{id}{add_tags}")
             res = self._get(url)
-            data = res.json()
+            data = self._json(res, list)
+            if data is None:
+                return {'post': []}
             COUNT = 0
             for post in data:
                 post['file_url'] = f"https://safebooru.org/images/{post['directory']}/{post['image']}"
@@ -464,7 +509,9 @@ class Konachan(Booru):
                 add_tags = ''
             url = self._request_url(f"&page={random.randint(0, max_pages-1)}{id}{add_tags}")
             res = self._get(url)
-            data = res.json()
+            data = self._json(res, list)
+            if data is None:
+                return {'post': []}
             COUNT = len(data)
             if COUNT == 0:
                 max_pages = 2
@@ -495,7 +542,9 @@ class Yandere(Booru):
                 add_tags = ''
             url = self._request_url(f"&page={random.randint(0, max_pages-1)}{id}{add_tags}")
             res = self._get(url)
-            data = res.json()
+            data = self._json(res, list)
+            if data is None:
+                return {'post': []}
             COUNT = len(data)
             if COUNT == 0:
                 max_pages = 2
@@ -526,7 +575,9 @@ class AIBooru(Booru):
                 add_tags = ''
             url = self._request_url(f"&page={random.randint(0, max_pages-1)}{id}{add_tags}")
             res = self._get(url)
-            data = res.json()
+            data = self._json(res, list)
+            if data is None:
+                return {'post': []}
             for post in data:
                 post['tags'] = post['tag_string']
             COUNT = len(data)
@@ -559,7 +610,9 @@ class Danbooru(Booru):
                 add_tags = ''
             url = self._request_url(f"&page={random.randint(0, max_pages-1)}{id}{add_tags}")
             res = self._get(url)
-            data = res.json()
+            data = self._json(res, list)
+            if data is None:
+                return {'post': []}
             for post in data:
                 post['tags'] = post['tag_string']
             COUNT = len(data)
@@ -580,7 +633,13 @@ class Danbooru(Booru):
         url = f"https://danbooru.donmai.us/posts/{id}.json"
         self.booru_url = url
         res = self._get(url)
-        data = res.json()
+        data = self._json(res, dict)
+        if data is None:
+            return {'post': []}
+        if 'tag_string' not in data:
+            detail = str(data.get('message') or data.get('error') or '')[:120].rstrip('.')
+            print(f"Ranbooru: danbooru has no post {id} (status {res.status_code}){': ' + detail if detail else ''}.")
+            return {'post': []}
         data['tags'] = data['tag_string']
         data = {'post': [data]}
         return data
@@ -598,7 +657,13 @@ class e621(Booru):
                 add_tags = ''
             url = self._request_url(f"&page={random.randint(0, max_pages-1)}{id}{add_tags}")
             res = self._get(url)
-            data = res.json()['posts']
+            reply = self._json(res, dict)
+            if reply is None:
+                return {'post': []}
+            data = reply.get('posts')
+            if not isinstance(data, list):
+                print(f"Ranbooru: e621 returned no post list (status {res.status_code}).{REFUSAL_HINTS.get(res.status_code, '')}")
+                return {'post': []}
             COUNT = len(data)
             for post in data:
                 temp_tags = []
